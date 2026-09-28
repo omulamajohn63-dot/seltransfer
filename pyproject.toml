@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seltransfer"
+version = "0.1.0"
+description = "Offline file transfer tool for local networks"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "SELTRANSFER Team", email = "dev@seltransfer.local"}
+]
+requires-python = ">=3.12"
+keywords = ["file-transfer", "offline", "local-network", "networking"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "typer[all]>=0.9.0",
+    "rich>=13.0.0",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "qrcode[pil]>=7.4.2",
+    "Pillow>=10.0.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "psutil>=5.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.0.292",
+    "mypy>=1.5.0",
+    "httpx>=0.24.0",
+]
+
+[project.scripts]
+seltransfer = "seltransfer.cli:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages]
+find = {where = ["src"]}
+
+[tool.setuptools.package-data]
+seltransfer = ["web/templates/*.html", "web/static/*"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --strict-markers --tb=short"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "BLE", "PLW"]
+
+[tool.ruff.lint.per-file-ignores]
+# typer.Option/Argument are callables, not defaults; this is the documented Typer idiom.
+"src/seltransfer/cli.py" = ["B008"]

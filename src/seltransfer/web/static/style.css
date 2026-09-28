@@ -1,0 +1,407 @@
+/* SELTRANSFER web client styles.
+ *
+ * The palette and type are unchanged from the original: a light paper surface,
+ * lime accent, orange alert, and flat monospaced labels. This pass modernises
+ * the execution only, adding radii, layered shadows, motion, keyboard focus
+ * rings, and a dark scheme, without moving the product's character.
+ *
+ * Two colour values were adjusted for WCAG AA at small sizes. The originals
+ * measured 3.14:1 (orange) and 4.18:1 (muted) against the paper background,
+ * which fails the 4.5:1 requirement for the 11px uppercase labels that use
+ * them. The replacements keep the same hue family.
+ */
+
+:root {
+    /* Surfaces */
+    --paper: #f2f5ef;
+    --card: rgba(255, 255, 255, .58);
+    --line: #d5e0d8;
+    --wash: #e4f2cf;
+
+    /* Ink.
+     *
+     * --ink is NOT a theme-aware colour. It is the constant deep brand green
+     * used as the fill behind lime text on primary, hover, and selected
+     * controls. Overriding it per theme previously turned those controls
+     * near-white in dark mode, leaving lime-on-white text at 1.09:1.
+     * --fg is the theme-aware foreground. Keep them separate. */
+    --ink: #17221d;
+    --on-fill: #c8f36d;
+    --fg: #17221d;
+    --muted: #5f6d64;
+
+    /* Accents */
+    --lime: #c8f36d;
+    --orange: #c44126;
+    --error-bg: #ffe4dc;
+    --error-line: #e7a08e;
+    --error-fg: #8e2f1d;
+
+    /* Shape */
+    --radius: 12px;
+    --radius-sm: 8px;
+
+    /* Depth */
+    --shadow-sm: 0 1px 2px rgba(23, 34, 29, .06);
+    --shadow-md: 0 2px 8px rgba(23, 34, 29, .07);
+    --shadow-lg: 0 8px 24px rgba(23, 34, 29, .10);
+
+    /* Motion */
+    --dur: 160ms;
+    --ease: cubic-bezier(.2, .7, .3, 1);
+
+    /* Focus ring. Chosen to stay legible against both the paper background
+     * (6.09:1) and the lime selection fill (5.26:1). */
+    --ring: #1d4ed8;
+
+    --sans: ui-sans-serif, system-ui, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, monospace;
+    --page: 1120px;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --paper: #101713;
+        --card: #1a221d;
+        --line: #2c3a32;
+        --wash: #17251c;
+
+        /* --ink and --on-fill are intentionally not overridden: the lime-on-deep
+         * green fill stays the same in both schemes. Only the surfaces and the
+         * theme-aware foreground change here. */
+        --fg: #e8efe9;
+        --muted: #9aa8a0;
+
+        --lime: #c8f36d;
+        --orange: #ff8a6b;
+        --error-bg: #3a1a14;
+        --error-line: #6b2d21;
+        --error-fg: #ffb4a2;
+
+        --shadow-sm: 0 1px 2px rgba(0, 0, 0, .32);
+        --shadow-md: 0 2px 8px rgba(0, 0, 0, .38);
+        --shadow-lg: 0 8px 24px rgba(0, 0, 0, .48);
+
+        --ring: #7aa7ff;
+    }
+}
+
+* { box-sizing: border-box; }
+
+body {
+    margin: 0;
+    color: var(--fg);
+    font-family: var(--sans);
+    background: radial-gradient(circle at 80% 0, var(--wash), transparent 34%), var(--paper);
+    -webkit-font-smoothing: antialiased;
+}
+
+/* Visually hidden but available to assistive technology.
+ *
+ * This rule was previously referenced by the device-name label in index.html
+ * but never defined, so the label rendered in plain sight and "Device name"
+ * appeared twice. */
+.sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+}
+
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 20px;
+    padding: 26px max(20px, calc((100% - var(--page)) / 2));
+    border-bottom: 1px solid var(--line);
+    background: var(--card);
+    backdrop-filter: blur(6px);
+}
+
+h1, h2, h3, p { margin: 0; }
+h1 { font-size: 22px; letter-spacing: 1px; }
+
+.kicker, .eyebrow, #identity, #network, .device span, .device small {
+    font: 500 11px var(--mono);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+}
+
+.kicker, .eyebrow, #identity, #network { color: var(--muted); }
+header .kicker { display: block; margin-bottom: 8px; }
+
+main {
+    max-width: var(--page);
+    margin: auto;
+    padding: 64px 20px;
+}
+
+.intro { max-width: 690px; margin-bottom: 48px; }
+.intro h2 {
+    font-size: clamp(42px, 7vw, 82px);
+    line-height: .95;
+    letter-spacing: -2px;
+    margin: 14px 0 20px;
+}
+.intro p:last-child { font-size: 18px; color: var(--muted); }
+
+.error {
+    padding: 14px 16px;
+    background: var(--error-bg);
+    border: 1px solid var(--error-line);
+    border-radius: var(--radius-sm);
+    color: var(--error-fg);
+    margin-bottom: 22px;
+}
+
+.toolbar, .section-heading, .send-panel {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 18px;
+}
+
+.toolbar {
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 16px;
+    margin-bottom: 28px;
+}
+
+button {
+    font: 600 13px var(--sans);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    background: var(--card);
+    color: var(--fg);
+    padding: 12px 16px;
+    cursor: pointer;
+    box-shadow: var(--shadow-sm);
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
+        border-color var(--dur) var(--ease), transform var(--dur) var(--ease),
+        box-shadow var(--dur) var(--ease);
+}
+
+button:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: var(--shadow-md);
+    border-color: var(--fg);
+}
+
+button:active:not(:disabled) { transform: translateY(0); box-shadow: var(--shadow-sm); }
+
+button:hover:not(:disabled):not(.primary):not(.selected),
+button.selected,
+button.primary {
+    background: var(--ink);
+    color: var(--on-fill);
+    border-color: var(--ink);
+}
+
+/* On the dark scheme a near-white hover fill would put lime text on a light
+ * background, so the hovered/selected fill is held at the deep brand green in
+ * both themes. Only the resting surface follows the scheme. */
+
+/* 0.45 measured 2.83:1 against the light surface, which is legal only because
+ * WCAG exempts disabled controls. 0.55 still reads clearly as inactive while
+ * lifting the label to 3.74:1 light / 5.12:1 dark. */
+button:disabled { opacity: .55; cursor: not-allowed; box-shadow: none; transform: none; }
+
+/* Keyboard focus. The page is entirely buttons, selects, and inputs, and it
+ * previously had no focus styling at all. */
+button:focus-visible,
+select:focus-visible,
+input:focus-visible,
+a:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+}
+
+.section-heading { margin: 24px 0 14px; }
+.section-heading h3 { font-size: 20px; }
+
+.identity-panel {
+    padding: 20px 24px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-sm);
+}
+
+.identity-panel .section-heading { margin-top: 0; }
+
+.device-name-form { display: flex; gap: 10px; flex-wrap: wrap; }
+.device-name-form input { flex: 1; min-width: 180px; }
+
+.devices {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 12px;
+    min-height: 72px;
+}
+
+.device {
+    display: grid;
+    text-align: left;
+    gap: 10px;
+    border-color: var(--line);
+    padding: 20px;
+    background: var(--card);
+    border-radius: var(--radius);
+    min-height: 132px;
+    box-shadow: var(--shadow-md);
+    transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease),
+        transform var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+
+.device:hover { transform: translateY(-2px); box-shadow: var(--shadow-lg); }
+
+.device strong { font-size: 17px; }
+.device small { color: var(--orange); text-transform: none; letter-spacing: 0; }
+
+/* Selection is drawn as a border plus a soft ring rather than a 3px outline,
+ * which previously shifted the whole card by the outline width. */
+.device.selected {
+    outline: none;
+    border-color: var(--lime);
+    border-width: 2px;
+    padding: 19px;
+    box-shadow: var(--shadow-lg), 0 0 0 3px rgba(200, 243, 109, .35);
+}
+
+/* Expanded per-device panel, built by buildDeviceDetails() in app.js. It was
+ * emitted with this class but had no styling, so it rendered as unstyled
+ * inline text inside the card. */
+.device-details {
+    display: grid;
+    gap: 6px;
+    margin-top: 4px;
+    padding-top: 12px;
+    border-top: 1px dashed var(--line);
+    font: 500 11px var(--mono);
+    color: var(--muted);
+    text-align: left;
+}
+
+.device-details span { color: var(--fg); }
+
+.send-panel {
+    margin: 52px 0;
+    padding: 24px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-md);
+}
+
+.send-panel h3 { font-size: 26px; margin: 8px 0; }
+.send-panel p:not(.eyebrow) { color: var(--muted); }
+
+#pair-status {
+    display: inline-block;
+    margin-top: 10px;
+    font: 600 11px var(--mono);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--muted);
+}
+
+#pair-status:not(:empty) {
+    padding: 5px 10px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--paper);
+}
+
+.actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+
+.transport-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font: 500 11px var(--mono);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--muted);
+}
+
+.transport-toggle select,
+.device-name-form input {
+    font: 600 12px var(--sans);
+    text-transform: none;
+    letter-spacing: 0;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    background: var(--card);
+    color: var(--fg);
+    padding: 11px 12px;
+    box-shadow: var(--shadow-sm);
+    transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+
+.transport-toggle select:hover,
+.device-name-form input:hover { border-color: var(--fg); }
+
+.activity {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    color: var(--muted);
+    padding: 14px 0;
+    border-bottom: 1px solid var(--line);
+}
+
+.activity span { flex: 1; min-width: 220px; }
+.activity button { padding: 8px 11px; }
+
+.history-row {
+    padding: 12px 0;
+    border-bottom: 1px solid var(--line);
+    font: 13px var(--mono);
+    color: var(--muted);
+}
+
+/* Set by initialize() with the server's download directory. */
+.storage-location {
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.5;
+    margin-bottom: 4px;
+}
+
+#transfer-status { color: var(--muted); font-size: 12px; }
+
+@media (max-width: 640px) {
+    header { padding: 20px; }
+    .kicker { font-size: 9px; }
+    #identity { font-size: 9px; }
+    main { padding: 42px 16px; }
+    .intro h2 { font-size: 48px; }
+    .send-panel { align-items: stretch; flex-direction: column; padding: 20px; }
+    .actions { width: 100%; }
+    .actions button { flex: 1; min-height: 54px; }
+    .transport-toggle { width: 100%; }
+    .transport-toggle select { flex: 1; }
+    .toolbar { align-items: flex-start; flex-direction: column; }
+    .toolbar button { width: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: .01ms !important;
+        scroll-behavior: auto !important;
+    }
+
+    button:hover:not(:disabled),
+    button:active:not(:disabled),
+    .device:hover { transform: none; }
+}
