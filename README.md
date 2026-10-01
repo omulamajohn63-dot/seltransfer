@@ -434,6 +434,8 @@ follows the system light or dark theme.
 
 - Live device list with online status and type
 - Per-device expandable detail panel showing ID, IP, transport, and session
+- Share panel: the connection QR code, the address as selectable text, plus copy,
+  share, and download
 - File and folder selection, including `webkitdirectory` folder uploads
 - Transport selector, defaulting to HTTP
 - Incoming transfer inbox with accept and reject
@@ -441,6 +443,21 @@ follows the system light or dark theme.
 
 The interface is a client of the same server that hosts it, which is why the
 browser can take part in transfers at all.
+
+### The share panel
+
+Any device with the page open can pass the address on, so the QR code is not
+something only the machine that started the server can show. Open the page on a
+phone, a tablet, or a second PC and the same panel is there.
+
+The code encodes only `scheme://address:port` — nothing else. Scanning it opens
+the page; it does not authorise anything. A device still has to ask to send, and
+the destination's user still has to click Approve.
+
+The address is always visible as text, and the code can be downloaded as an SVG,
+because a `http://` address on a LAN IP is not a secure context: the clipboard and
+the native share sheet are usually unavailable there, so the panel does not depend
+on either. Copy and Share appear when the browser supports them.
 
 ---
 
@@ -468,8 +485,9 @@ The spec lives at `packaging/seltransfer.spec` and derives every path from its o
 location, so it works in any checkout. It collects the web assets as data where
 `seltransfer.resources` looks for them, and excludes the test and build stack.
 Pillow is excluded because nothing in the runtime path imports it — the CLI
-renders the QR with `print_ascii` — but it stays a source dependency so the test
-suite still works.
+renders the QR with `print_ascii`, and the QR served to the browser is written as
+SVG by `seltransfer.qr` — but it stays a source dependency so the test suite still
+works.
 
 **A build is not a clean-machine test.** The remaining checks need a Windows
 machine with no Python and a second device; see
@@ -584,8 +602,10 @@ seltransfer allow-firewall --port 9000
 
 ### QR code does not render
 
-Terminal QR output is best-effort. Type the URL into the phone's browser
-manually, or read it from the terminal output.
+The terminal QR output is best-effort. In the web interface the code is served by
+`GET /api/qr.svg`, so a blank panel means the page could not reach the server; the
+address next to it is the fallback — type it into the phone's browser manually, or
+use Download QR and open the file.
 
 ### The phone cannot reach the PC on a phone hotspot
 
@@ -621,6 +641,7 @@ seltransfer/
 │   ├── config.py                Settings, paths, local token
 │   ├── devices.py               Registry and UDP broadcast discovery
 │   ├── pairing.py               Pairing codes and pairings
+│   ├── qr.py                    Connection QR as SVG (no Pillow)
 │   ├── resources.py             Asset resolution, source and frozen
 │   ├── storage.py               SQLite history
 │   ├── transfers.py             State machine, limits, file writing
@@ -649,6 +670,7 @@ seltransfer/
     ├── test_pairing_http.py     Pairing and identity at the boundary
     ├── test_packaging.py        Build configuration
     ├── test_phone_delivery.py   End-to-end PC → phone
+    ├── test_qr.py               Connection QR rendering and imports
     ├── test_resources.py        Asset resolution
     ├── test_tls.py              Opt-in TLS
     ├── test_transfers.py        State machine

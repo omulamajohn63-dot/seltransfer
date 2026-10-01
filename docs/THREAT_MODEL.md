@@ -72,6 +72,20 @@ labelled with a chosen sender name. This is a phishing surface, not a data
 exposure. *Mitigation considered:* show the sender's IP alongside the name.
 *Not yet implemented.*
 
+**Design note — the share panel (`GET /api/qr.svg`).** Any device with the page
+open can be shown the connection code, so the endpoint is anonymous like
+`/api/connection`. A peer scanning the network can learn the address and port this
+way, and it could already: both values are in the terminal banner, in the page, and
+in `GET /api/connection`. The payload is only ever `scheme://address:port` — no
+session token, local token, pairing code, device ID, or path — and the endpoint
+takes no parameters, so it is neither an encoder for attacker-chosen strings nor a
+source of reflected content. Scanning it grants nothing, because a device still
+has to request a transfer and the destination's user still has to approve it.
+
+**Residual risk:** the code and its address are a convenient beacon for someone who
+can see the screen. The user has to choose where the page is shown; that is the
+control, and it is the same control the terminal QR always had.
+
 ### A2 — Malicious browser calling the API directly
 
 A page open in a user's browser, on the Internet, trying to drive the server.

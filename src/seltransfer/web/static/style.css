@@ -239,6 +239,87 @@ a:focus-visible {
 .device-name-form { display: flex; gap: 10px; flex-wrap: wrap; }
 .device-name-form input { flex: 1; min-width: 180px; }
 
+/* --- share panel ------------------------------------------------------------
+   The QR image comes from /api/qr.svg, so it is vector and stays sharp when a
+   phone scales it up to fill its screen. The frame reserves the square before
+   the code arrives so the panel does not jump, and it stays paper-white: a
+   scanner needs hard black on white, and the themed surfaces are not
+   guaranteed to give that contrast. */
+
+.share-panel {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 24px;
+    margin-bottom: 28px;
+    padding: 20px 24px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-sm);
+}
+
+.share-qr-frame {
+    flex: 0 0 auto;
+    display: grid;
+    place-items: center;
+    width: 208px;
+    height: 208px;
+    padding: 8px;
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+}
+
+.share-qr-frame img { display: block; width: 100%; height: 100%; }
+
+.share-details { flex: 1 1 320px; }
+.share-details .section-heading { margin-top: 0; }
+
+.share-hint { color: var(--muted); font-size: 13px; max-width: 60ch; }
+
+/* The address is the one thing that must stay readable and selectable: a
+   plain-HTTP LAN origin is not a secure context, so the clipboard API is
+   usually missing on exactly the URL this tool prints. */
+.share-url {
+    margin: 12px 0;
+    padding: 10px 12px;
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    font: 600 14px var(--mono);
+    overflow-wrap: anywhere;
+    user-select: all;
+}
+
+.share-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* The download is a real link so it works with scripting unavailable, which is
+   why it is styled to match the buttons rather than left as bare text. */
+.button-link {
+    display: inline-flex;
+    align-items: center;
+    font: 600 13px var(--sans);
+    padding: 12px 16px;
+    color: var(--fg);
+    text-decoration: none;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-sm);
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
+        border-color var(--dur) var(--ease), transform var(--dur) var(--ease),
+        box-shadow var(--dur) var(--ease);
+}
+
+.button-link:hover {
+    transform: translateY(-1px);
+    border-color: var(--fg);
+    box-shadow: var(--shadow-md);
+}
+
+.share-status { min-height: 1em; margin-top: 10px; font-size: 12px; color: var(--muted); }
+
 .devices {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
@@ -436,6 +517,9 @@ a:focus-visible {
     .transport-toggle select { flex: 1; }
     .toolbar { align-items: flex-start; flex-direction: column; }
     .toolbar button { width: 100%; }
+    .share-panel { padding: 16px; }
+    .share-qr-frame { width: 100%; height: auto; aspect-ratio: 1; }
+    .share-actions button, .share-actions .button-link { flex: 1; justify-content: center; }
 }
 
 @media (prefers-reduced-motion: reduce) {

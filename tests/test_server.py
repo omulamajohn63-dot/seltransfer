@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from seltransfer.devices import resolve_device_display_name, validate_device_name
+from seltransfer.qr import connection_qr_svg
 from seltransfer.server.app import create_app
 from seltransfer.storage import HistoryStore
 from tests.conftest import make_app, pair
@@ -77,7 +78,39 @@ def test_validate_device_name_rejects_invalid_inputs():
         assert validate_device_name(valid) == expected
 
 
-def test_browser_registration_uses_display_name_priority(client):
+def test_qr_svg_encodes_exactly_the_advertised_address(client):
+    """The panel shows the image and the URL together, so they must be one payload.
+
+    Comparing against a render of the advertised URL is stronger than looking for
+    the URL inside the SVG: the code is drawn as path data, so the address is not
+    readable in the document text, and a drifting endpoint would still pass a
+    substring check on some other change.
+    """
+    qr = client.get("/api/qr.svg")
+    assert qr.status_code == 200
+    assert qr.headers["content-type"] == "image/svg+xml"
+    assert "<svg" in qr.text
+
+    advertised = client.get("/api/connection").json()["qr"]["url"]
+    assert qr.text == connection_qr_svg(advertised)
+
+
+def test_qr_svg_takes_no_input_from_the_caller(client):
+    """A peer probing for reflected strings has nothing to reflect.
+
+    The payload is built from the detected address, the port, and the configured
+    scheme. Keeping the caller's query out of it is what makes this endpoint a
+    fixed amount of work for an unauthenticated caller, rather than an encoder
+    they can hand arbitrary strings to.
+    """
+    hostile = "javascript:alert(1)"
+    qr = client.get(f"/api/qr.svg?bad={hostile}")
+
+    assert qr.status_code == 200
+    assert hostile not in qr.text
+    advertised = client.get("/api/connection").json()["qr"]["url"]
+    assert qr.text == connection_qr_svg(advertised)
+
     payload = {
         "device_id": "browser-device-display-name",
         "display_name": "SILAS PHONE",

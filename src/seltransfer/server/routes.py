@@ -11,11 +11,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
 from seltransfer.config import verify_local_token
 from seltransfer.devices import Device, resolve_device_display_name
+from seltransfer.qr import connection_qr_svg
 from seltransfer.transfers import sweep_expired_transfers
 
 router = APIRouter()
@@ -340,6 +341,19 @@ def _sweep_sessions(request: Request) -> None:
         request.app.state.transfers, request.app.state.browser_timeout)
 
 
+def connection_url(request: Request) -> str:
+    """The address a device on this network opens to reach this server.
+
+    One function, used by both ``/api/connection`` and the QR image, so the URL
+    on screen and the URL in the scannable code cannot drift apart. A device that
+    joins from a QR showing one address and a page showing another would be a
+    miserable bug to chase.
+    """
+    device = request.app.state.registry.local_device
+    settings = request.app.state.settings
+    return f"{settings.scheme()}://{device.ip}:{device.port}"
+
+
 @router.get("/api/status", response_model=StatusResponse)
 async def get_status(request: Request):
     from seltransfer import __version__
@@ -377,8 +391,34 @@ async def get_connection_info(request: Request):
         download_directory=(
             str(request.app.state.transfers.download_root.resolve())
             if expose else "hidden; set SELTRANSFER_EXPOSE_PATHS=true to show"),
-        qr={"url": f"{scheme}://{device.ip}:{device.port}",
+        qr={"url": connection_url(request),
             "service": "seltransfer", "version": 1, **device.public()})
+
+
+@router.get("/api/qr.svg")
+async def get_connection_qr(request: Request):
+    """Render the connection QR code so any connected device can share it.
+
+    The web interface shows this on the PC and on every phone, which is what lets
+    a phone pass the address on to a third device without anyone walking back to
+    the terminal. It is anonymous for the same reason ``/api/connection`` is: the
+    payload is the address of a server that is already answering a LAN peer, and
+    a device that has just scanned the code needs to be able to pass it on.
+
+    Deliberately takes no parameters. The encoded string is built from the
+    detected address, the port, and the configured scheme, so an unauthenticated
+    caller cannot make the server encode data of its choosing - a QR encoder is
+    cheap for a short string and expensive for a long one, and an endpoint that
+    encoded whatever it was handed would be a free way to spend this process's
+    time. Nothing secret is in the code: no session token, no local token, no
+    pairing code. Scanning it joins the network, and pairing is still required
+    before anything can be sent.
+    """
+    return Response(
+        content=connection_qr_svg(connection_url(request)),
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.get("/api/devices")

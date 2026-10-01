@@ -81,6 +81,7 @@ local CLI token; `session` = a live browser session.
 | `GET /api/health` | nothing | 200, liveness only |
 | `GET /api/status` | nothing | 200; version, identity of this node, no secrets |
 | `GET /api/connection` | nothing | 200; address, port, and QR payload |
+| `GET /api/qr.svg` | nothing | 200; QR code for this server's own URL, no caller input |
 | `GET /api/devices` | nothing | 200; device list, but `paired_devices` empty and `local_user` false |
 | `POST /api/devices/discover` | nothing | 200; starts UDP discovery |
 | `POST /api/browser/register` | nothing | 200; issues a session (bounded) |
@@ -140,6 +141,26 @@ Two rows deserve emphasis:
   request a code, read it out of the response, and confirm it immediately. The
   code is readable only via `GET /api/pairing/pending`, which requires the local
   user.
+
+### The QR code
+
+`GET /api/qr.svg` is anonymous so that a device which has only opened the page
+can pass the address on by showing the code. That makes the panel a deliberate
+disclosure surface, so it is worth being exact about what it gives away:
+
+- The payload is only ever `scheme://address:port` — the same value
+  `GET /api/connection` already reports to any caller. Nothing is disclosed that
+  was not public before: no session token, no local token, no pairing code, no
+  device ID, and no filesystem path.
+- Scanning it grants **nothing**. Opening the page and asking to send a file still
+  requires the destination's user to click Approve, which is the whole point of
+  the pairing flow above.
+- It takes no parameters, so an unauthenticated caller cannot use it as an
+  encoder for strings of their choosing. The work per request is fixed.
+- It is rendered without Pillow, because the frozen build in
+  `packaging/seltransfer.spec` excludes both `PIL` and `seltransfer.utils`. The
+  SVG is written from the QR library's vector output, so the module that the
+  server runs is importable inside the bundle.
 
 ### Pairing
 

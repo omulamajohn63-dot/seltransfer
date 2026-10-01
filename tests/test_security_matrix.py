@@ -52,6 +52,7 @@ BODIES = {
 ANON_200 = {"200, liveness only",
             "200; version, identity of this node, no secrets",
             "200; address, port, and QR payload",
+            "200; QR code for this server's own URL, no caller input",
             "200; device list, but `paired_devices` empty and `local_user` false",
             "200; starts UDP discovery", "200; issues a session (bounded)",
             "200; returns **no code**",

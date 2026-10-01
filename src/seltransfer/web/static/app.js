@@ -151,6 +151,22 @@ async function saveBlob(blob, name) {
     return filename;
 }
 
+// The text a share sheet or the clipboard receives.
+//
+// The address goes in `text` rather than `url` on purpose: every messaging app
+// auto-links a bare URL in the body, while `url` is ignored by some of them and
+// shows up as a duplicate in the others. The scheme is checked here rather than
+// trusted, so nothing but an http(s) address can ever reach a share sheet - a
+// `javascript:` payload in this field would be one tap away from executing on
+// whichever app the user picked.
+function sharePayload(url) {
+    const value = String(url ?? "").trim();
+    if (!/^https?:\/\/[^\s]+$/i.test(value)) {
+        throw new Error("There is no connection address to share yet.");
+    }
+    return { title: "SELTRANSFER", text: value };
+}
+
 class SeltransferApp {
     constructor() {
         this.devices = [];
@@ -158,6 +174,9 @@ class SeltransferApp {
         this.expanded = new Set();
         this.session = JSON.parse(localStorage.getItem("seltransfer-session") || "null");
         this.serverDeviceId = null;
+        // The address any connected device can pass on to another one. Set from
+        // /api/connection, which is the same payload the QR image encodes.
+        this.connectionUrl = "";
         this.refreshInFlight = false;
         // HTTP is the default. WebRTC is opt-in for users who want the
         // peer-to-peer path; see the transport toggle in index.html.
@@ -173,6 +192,10 @@ class SeltransferApp {
         this.$("folder-input").addEventListener("change", (event) => this.send(event.target.files));
         const approvalRequest = this.$("pair-approval-request");
         if (approvalRequest) approvalRequest.addEventListener("click", () => this.requestApproval());
+        const shareCopy = this.$("share-copy");
+        if (shareCopy) shareCopy.addEventListener("click", () => this.copyShareLink());
+        const shareButton = this.$("share-share");
+        if (shareButton) shareButton.addEventListener("click", () => this.shareConnection());
         const transportToggle = this.$("transport-mode");
         if (transportToggle) {
             transportToggle.value = this.transport;
@@ -220,6 +243,9 @@ class SeltransferApp {
             const connection = await this.api("/api/connection");
             this.serverDeviceId = connection.device_id;
             this.$("network").textContent = `${connection.local_address}:${connection.server_port}`;
+            // Every device with this page open shares the same address, so the
+            // QR is not something only the PC that started the server can show.
+            this.renderSharePanel(connection.qr?.url || "");
             await this.registerBrowser(connection.device_id);
             this.$("storage-location").textContent = `Native files received by this server are saved in: ${connection.download_directory}. Browser receivers download files using their own browser settings.`;
             await this.loadDevices(); await this.loadIncoming(); await this.loadHistory(); await this.loadPendingPairings();
@@ -240,6 +266,73 @@ class SeltransferApp {
     async renewSession() {
         await this.registerBrowser(this.serverDeviceId);
         await Promise.all([this.loadDevices(), this.loadIncoming(), this.loadHistory()]);
+    }
+    // The share panel.
+    //
+    // The address reaches other devices two ways, and both have to work on a
+    // phone: the QR image, and the URL as selectable text. `navigator.clipboard`
+    // and `navigator.share` both require a secure context, and this page is
+    // served over plain HTTP on a LAN address, so they are usually missing here.
+    // The panel therefore never depends on either of them, and every use of them
+    // is feature-detected with a fallback the user can act on.
+    renderSharePanel(url) {
+        this.connectionUrl = String(url ?? "").trim();
+        const image = this.$("share-qr");
+        const label = this.$("share-url");
+        const copy = this.$("share-copy");
+        const share = this.$("share-share");
+        const status = this.$("share-status");
+        if (status) status.textContent = "";
+        if (!this.connectionUrl) {
+            // No broken-image icon in the panel before the first response lands.
+            if (image) image.hidden = true;
+            if (label) label.textContent = "Connecting...";
+            if (copy) copy.disabled = true;
+            if (share) share.hidden = true;
+            return;
+        }
+        // The image src is the constant endpoint, never the address itself, so
+        // there is no path by which a value from the server reaches an attribute.
+        // The code is rendered server-side, which keeps the client free of a QR
+        // encoder and free of a script from anywhere but this origin.
+        if (image) { image.hidden = false; image.src = "/api/qr.svg"; }
+        if (label) label.textContent = this.connectionUrl;
+        if (copy) copy.disabled = false;
+        if (share) share.hidden = typeof navigator.share !== "function";
+    }
+    async copyShareLink() {
+        const status = this.$("share-status");
+        let text;
+        try { text = sharePayload(this.connectionUrl).text; }
+        catch (error) { if (status) status.textContent = error.message; return; }
+        if (typeof navigator.clipboard?.writeText !== "function") {
+            if (status) status.textContent = "This browser blocks clipboard access on an unencrypted page. Select the address above and copy it.";
+            return;
+        }
+        try {
+            await navigator.clipboard.writeText(text);
+            if (status) status.textContent = "Address copied.";
+        } catch (error) {
+            if (status) status.textContent = "Could not copy the address. Select it above and copy it.";
+        }
+    }
+    async shareConnection() {
+        const status = this.$("share-status");
+        let payload;
+        try { payload = sharePayload(this.connectionUrl); }
+        catch (error) { if (status) status.textContent = error.message; return; }
+        if (typeof navigator.share !== "function") {
+            if (status) status.textContent = "This browser cannot share directly. Select the address above and copy it.";
+            return;
+        }
+        try {
+            await navigator.share(payload);
+            if (status) status.textContent = "Shared.";
+        } catch (error) {
+            // A share sheet the user dismissed is not a failure, and saying so
+            // would train them to ignore this line.
+            if (error?.name !== "AbortError" && status) status.textContent = `Could not share: ${error.message}`;
+        }
     }
     detectBrowserDeviceInfo() {
         const ua = navigator.userAgent || "";
