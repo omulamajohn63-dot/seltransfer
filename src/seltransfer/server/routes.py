@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import secrets
 import sys
 import time
@@ -11,9 +12,11 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+from seltransfer.config import verify_local_token
 from seltransfer.devices import Device, resolve_device_display_name
+from seltransfer.transfers import sweep_expired_transfers
 
 router = APIRouter()
 
@@ -39,6 +42,10 @@ class ConnectionResponse(BaseModel):
     device_id: str | None = None
     download_directory: str
     qr: dict
+    # Which scheme the QR and the printed URL must use. "http" unless TLS is
+    # actually configured and readable.
+    scheme: str = "http"
+    https_enabled: bool = False
 
 
 class TransferFile(BaseModel):
@@ -57,14 +64,60 @@ class TransferCreate(BaseModel):
 
 
 class IncomingTransfer(BaseModel):
-    transfer_id: str = Field(min_length=1, max_length=128)
-    sender: dict
+    transfer_id: str = Field(min_length=8, max_length=128, pattern=DEVICE_ID_PATTERN)
+    # Previously a bare ``dict``. Anything could be posted here and it was stored
+    # verbatim in the history row, which made this an unbounded metadata sink and
+    # let a peer inject arbitrary keys into the transfer record.
+    sender: SenderIdentity
     files: list[TransferFile] = Field(min_length=1, max_length=10000)
     total_bytes: int = Field(ge=0)
     receiver_id: str | None = Field(default=None, max_length=128, pattern=DEVICE_ID_PATTERN)
     transport: Literal["http", "webrtc"] = "http"
     # The announcing sender supplies the token it will present when pushing bytes.
     token: str | None = Field(default=None, min_length=16, max_length=128)
+
+
+class SenderIdentity(BaseModel):
+    """The subset of sender metadata a peer is allowed to assert.
+
+    Device IDs and names are attacker-controlled, so they are constrained to the
+    same shape as everywhere else and stripped of control characters before they
+    reach storage, logs, or the browser.
+    """
+
+    device_id: str = Field(min_length=8, max_length=128, pattern=DEVICE_ID_PATTERN)
+    name: str = Field(default="Unknown device", min_length=1, max_length=128)
+    display_name: str | None = Field(default=None, max_length=128)
+    type: str = Field(default="computer", max_length=32)
+    node_type: Literal["browser", "server"] = "server"
+    ip: str | None = Field(default=None, max_length=64)
+    port: int | None = Field(default=None, ge=1, le=65535)
+
+    @field_validator("name", "display_name")
+    @classmethod
+    def _no_control_characters(cls, value: str | None) -> str | None:
+        """Strip control characters so nothing can forge a log line."""
+        if value is None:
+            return None
+        cleaned = "".join(
+            character for character in value
+            if character.isprintable() and character not in "\r\n\t"
+        ).strip()
+        return cleaned or "Unknown device"
+
+
+IncomingTransfer.model_rebuild()
+
+
+class PairingRequestBody(BaseModel):
+    """Ask a device to be paired. The code comes back in the response."""
+
+    device_id: str = Field(min_length=8, max_length=128, pattern=DEVICE_ID_PATTERN)
+
+
+class PairingConfirmBody(BaseModel):
+    device_id: str = Field(min_length=8, max_length=128, pattern=DEVICE_ID_PATTERN)
+    code: str = Field(min_length=4, max_length=32)
 
 
 class BrowserRegistration(BaseModel):
@@ -106,11 +159,31 @@ def _services(request: Request):
     return request.app.state.registry, request.app.state.transfers
 
 
+def settings_max_sessions(request: Request) -> int:
+    return int(getattr(request.app.state.settings, "max_browser_sessions", 500))
+
+
+def settings_max_webrtc_sessions(request: Request) -> int:
+    return int(getattr(request.app.state.settings, "max_webrtc_sessions", 200))
+
+
 def _browser_auth(request: Request, device_id: str) -> bool:
     token = request.headers.get("x-seltransfer-session", "")
     session = request.app.state.browser_sessions.get(token)
     return bool(session and session["device_id"] == device_id and
                 session["expires_at"] > time.time())
+
+
+def _local_token_valid(request: Request) -> bool:
+    """True when the caller presented this machine's local CLI token.
+
+    The token is written to the per-user application directory, so it is readable
+    by the CLI on this machine and by nothing on the network.
+    """
+    return verify_local_token(
+        request.headers.get("x-seltransfer-local", ""),
+        getattr(request.app.state, "local_token", None),
+    )
 
 
 def _session_device_id(request: Request) -> str | None:
@@ -121,6 +194,44 @@ def _session_device_id(request: Request) -> str | None:
     return None
 
 
+def _peer_is_this_machine(request: Request) -> bool:
+    """True when the TCP peer is this machine.
+
+    ``request.client.host`` is the address the connection actually came from, which
+    a remote peer cannot forge. It is the only thing that separates the user's own
+    browser from a device on the LAN, and therefore the only thing that can decide
+    who counts as "this machine's user".
+    """
+    host = request.client.host if request.client else ""
+    if not host:
+        return False
+    try:
+        if ipaddress.ip_address(host).is_loopback:
+            return True
+    except ValueError:
+        return False
+    # The user may also open the interface via this machine's own LAN address, which
+    # is a peer address but still this host.
+    return host == getattr(request.app.state, "local_address", None)
+
+
+def _is_local_user(request: Request) -> bool:
+    """True for the machine's own user: the local CLI, or a browser on this host.
+
+    A session token alone is *not* enough. ``POST /api/browser/register`` is
+    unauthenticated by necessity - a phone has to be able to announce itself before
+    anything else can be trusted - so "has a session" only means "some peer asked
+    for one". Treating that as authority let any device on the LAN pair any device,
+    which is the exact hole the code flow was added to close.
+    """
+    if _local_token_valid(request):
+        return True
+    token = request.headers.get("x-seltransfer-session", "")
+    session = request.app.state.browser_sessions.get(token)
+    return bool(session and session["expires_at"] > time.time()
+                and session.get("local"))
+
+
 def _effective_receiver_id(request: Request, payload_receiver_id: str | None = None) -> str:
     return (payload_receiver_id or _session_device_id(request)
             or request.app.state.registry.local_device.device_id)
@@ -129,30 +240,57 @@ def _effective_receiver_id(request: Request, payload_receiver_id: str | None = N
 def _caller(request: Request) -> str:
     """Resolve the acting device.
 
-    A browser session identifies itself with ``x-seltransfer-session``; anything
-    else is treated as the local server node, which is the native CLI talking to
-    its own instance.
+    A browser session identifies itself with ``x-seltransfer-session``. The native
+    CLI presents ``x-seltransfer-local`` with a token that only this machine can
+    read. Anything else is anonymous and gets no identity at all.
+
+    The previous version fell back to the local device ID for unauthenticated
+    callers, which meant any peer on the LAN silently inherited the local node's
+    identity: it could read local history, cancel local transfers, and obtain
+    upload tokens. Anonymous callers now get an empty identity, and the routes
+    that need one reject them.
     """
-    return _session_device_id(request) or request.app.state.registry.local_device.device_id
+    device_id = _session_device_id(request)
+    if device_id:
+        return device_id
+    if _local_token_valid(request):
+        return str(request.app.state.registry.local_device.device_id)
+    return ""
+
+
+def _is_trusted_local_or_session(request: Request) -> bool:
+    """True when the caller has proven identity as a session or the local CLI."""
+    return bool(_session_device_id(request) or _local_token_valid(request))
 
 
 def _assert_transfer_visibility(request: Request, transfer: dict[str, Any]) -> None:
     """Restrict a transfer to the two devices involved in it."""
     caller = _caller(request)
+    if not caller:
+        raise HTTPException(
+            401, "a browser session or the local CLI token is required")
     if transfer.get("sender_id") != caller and transfer.get("receiver_id") != caller:
         raise HTTPException(403, "transfer is not visible to this device")
 
 
 def _assert_receiver_authorized(request: Request, transfer: dict[str, Any]) -> None:
     """Only the intended receiver may accept or reject."""
-    if transfer.get("receiver_id") != _caller(request):
+    caller = _caller(request)
+    if not caller:
+        raise HTTPException(
+            401, "a browser session or the local CLI token is required")
+    if transfer.get("receiver_id") != caller:
         raise HTTPException(
             403, "only the intended receiver can accept or reject this transfer")
 
 
 def _assert_sender_authorized(request: Request, transfer: dict[str, Any]) -> None:
     """Only the sender may pause, resume, or cancel its own transfer."""
-    if transfer.get("sender_id") != _caller(request):
+    caller = _caller(request)
+    if not caller:
+        raise HTTPException(
+            401, "a browser session or the local CLI token is required")
+    if transfer.get("sender_id") != caller:
         raise HTTPException(
             403, "only the sender can pause, resume, or cancel this transfer")
 
@@ -180,9 +318,32 @@ def _is_upload_authorized(request: Request, transfer: dict[str, Any]) -> bool:
     return receiver is None or receiver.node_type != "browser"
 
 
+def _sweep_sessions(request: Request) -> None:
+    """Drop expired browser sessions and WebRTC sessions.
+
+    Expiry used to be checked lazily on lookup only, which meant the dictionaries
+    kept every session ever issued. ``POST /api/browser/register`` is
+    unauthenticated and needs no secret, so a peer could grow the process without
+    bound. Deleting on access plus the periodic timer in the lifespan closes that.
+    """
+    now = time.time()
+    sessions = request.app.state.browser_sessions
+    for token in [token for token, data in sessions.items()
+                  if data["expires_at"] <= now]:
+        del sessions[token]
+    webrtc = request.app.state.webrtc_sessions
+    for session_id in [key for key, data in webrtc.items()
+                       if now - data["created_at"] > request.app.state.browser_timeout]:
+        del webrtc[session_id]
+    request.app.state.pairing.sweep(now)
+    sweep_expired_transfers(
+        request.app.state.transfers, request.app.state.browser_timeout)
+
+
 @router.get("/api/status", response_model=StatusResponse)
 async def get_status(request: Request):
     from seltransfer import __version__
+    _sweep_sessions(request)
     device = request.app.state.registry.local_device
     return StatusResponse(
         status="online", message="SELTRANSFER server is running",
@@ -196,14 +357,27 @@ async def health_check():
 
 @router.get("/api/connection", response_model=ConnectionResponse)
 async def get_connection_info(request: Request):
+    """Describe how to reach this server.
+
+    The absolute download path is withheld unless the operator opted in. It was
+    previously returned to any unauthenticated caller, which told a peer on the
+    LAN exactly where to look on this filesystem for received files. The web
+    interface degrades to a generic message when it is hidden.
+    """
     device = request.app.state.registry.local_device
+    expose = bool(getattr(request.app.state.settings, "expose_paths", False))
+    settings = request.app.state.settings
+    scheme = settings.scheme()
     return ConnectionResponse(
         connected=True, device_name=device.name, local_address=device.ip,
         server_port=device.port, platform=sys.platform,
         device_id=device.device_id,
-        download_directory=str(
-            request.app.state.transfers.download_root.resolve()),
-        qr={"url": f"http://{device.ip}:{device.port}",
+        scheme=scheme,
+        https_enabled=settings.https_enabled,
+        download_directory=(
+            str(request.app.state.transfers.download_root.resolve())
+            if expose else "hidden; set SELTRANSFER_EXPOSE_PATHS=true to show"),
+        qr={"url": f"{scheme}://{device.ip}:{device.port}",
             "service": "seltransfer", "version": 1, **device.public()})
 
 
@@ -212,6 +386,16 @@ async def get_devices(request: Request):
     registry, _ = _services(request)
     return {"devices": registry.list(), "local_device_id": registry.local_device.device_id,
             "server_device": registry.local_device.public(),
+            # Whether this caller is the machine's own user. The client uses it to
+            # decide whether to offer one-click pairing or the out-of-band code
+            # flow; it describes the caller, so disclosing it discloses nothing.
+            "local_user": _is_local_user(request),
+            # Which devices this server has paired. Only meaningful to a caller
+            # with an identity; an anonymous peer is told nothing, since the list
+            # is a map of who may be contacted.
+            "paired_devices": sorted(
+                request.app.state.pairing.paired_devices())
+            if _is_trusted_local_or_session(request) else [],
             "browser_session_device_id": next(
                 (item["device_id"] for item in request.app.state.browser_sessions.values()
                  if item["expires_at"] > time.time()), None)}
@@ -239,13 +423,27 @@ async def register_browser(payload: BrowserRegistration, request: Request):
                     if request.client else None, port=None, platform=payload.platform,
                     browser=payload.browser, capabilities=payload.capabilities,
                     session_id=token, display_name=resolved_name)
+    _sweep_sessions(request)
+    # Bound the table. Registering is unauthenticated, so without a cap it is a
+    # cheap way to make the process grow.
+    if len(request.app.state.browser_sessions) >= settings_max_sessions(request):
+        oldest = sorted(
+            request.app.state.browser_sessions.items(),
+            key=lambda item: item[1]["expires_at"],
+        )
+        for stale, _data in oldest[:len(oldest) // 4 + 1]:
+            del request.app.state.browser_sessions[stale]
     try:
         registry.register_browser(device)
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
     expires_at = time.time() + request.app.state.browser_timeout
     request.app.state.browser_sessions[token] = {
-        "device_id": payload.device_id, "expires_at": expires_at}
+        "device_id": payload.device_id, "expires_at": expires_at,
+        # Whether this session belongs to the machine's own user. See
+        # `_is_local_user`: a session from a LAN peer is not authority to pair.
+        "local": _peer_is_this_machine(request),
+    }
     logger = request.app.state.logger
     logger.info("BROWSER registered device=%s", payload.device_id)
     return {"device_id": payload.device_id, "session_id": token,
@@ -296,8 +494,17 @@ async def create_webrtc_session(payload: WebRTCSessionRequest, request: Request)
             owner_device_id = local_device_id
     if not owner_device_id:
         raise HTTPException(401, "valid browser session required")
+    _sweep_sessions(request)
+    sessions = request.app.state.webrtc_sessions
+    limit = settings_max_webrtc_sessions(request)
+    if len(sessions) >= limit:
+        # A session row holds buffered signalling messages, so this table is a
+        # memory sink a paired peer can grow without bound. Refuse rather than
+        # evict someone's live connection.
+        raise HTTPException(
+            503, f"too many WebRTC sessions ({limit}); try HTTP instead")
     session_id = secrets.token_urlsafe(24)
-    request.app.state.webrtc_sessions[session_id] = {
+    sessions[session_id] = {
         "owner": request.headers.get("x-seltransfer-session"),
         "owner_device_id": owner_device_id,
         "peer_device_id": payload.peer_device_id,
@@ -383,19 +590,179 @@ async def discover_devices(request: Request):
     return {"devices": registry.list()}
 
 
+@router.post("/api/devices/{device_id}/pair/request")
+async def request_pairing(device_id: str, payload: PairingRequestBody,
+                          request: Request):
+    """Begin pairing by producing a code the destination must read.
+
+    The response deliberately does **not** contain the code. An earlier version
+    did, which made the whole flow self-service: an anonymous peer could call this
+    endpoint, read the code out of the response, and immediately confirm it. Two
+    requests, no out-of-band element, pairing complete - and pairing is the
+    precondition for creating a transfer.
+
+    The code is displayed by the destination instead, via
+    ``GET /api/pairing/pending``, and the requester reads it off that screen.
+    """
+    registry, _ = _services(request)
+    if device_id != payload.device_id:
+        raise HTTPException(422, "device_id in the path and body must match")
+    device = registry.get(device_id)
+    if not device:
+        raise HTTPException(404, "device is unavailable")
+    pairing = request.app.state.pairing
+    try:
+        pending = pairing.request(device_id, _caller(request))
+    except LookupError as error:
+        raise HTTPException(429, str(error)) from error
+    # No code, and no hash. The requester now has to be told one by the user.
+    return {
+        **pending.public(),
+        "next": ("ask the user of this machine to read the code it is showing, "
+                 "then POST it to /api/devices/{device_id}/pair/confirm"),
+    }
+
+
+@router.get("/api/pairing/status/{device_id}")
+async def pairing_status(device_id: str, request: Request):
+    """Whether a device is paired, so a requester can poll for approval.
+
+    Available to anyone, deliberately. The requester has to learn that the
+    destination's user approved, and there is nothing secret here to learn: the
+    code is never returned, and the same pairing state is already published by
+    ``GET /api/devices`` as ``paired_devices``. If this were restricted to the
+    local user, the requester could only find out by asking that user, which is
+    the interaction approval exists to remove.
+    """
+    registry, _ = _services(request)
+    if not registry.get(device_id):
+        raise HTTPException(404, "device is unavailable")
+    pairing = request.app.state.pairing.get(device_id)
+    return {
+        "device_id": device_id,
+        "paired": pairing is not None,
+        "method": pairing.method if pairing else None,
+        "expires_at": pairing.expires_at if pairing else None,
+    }
+
+
+@router.post("/api/pairing/requests/{request_id}/approve")
+async def approve_pairing(request_id: str, request: Request):
+    """Grant a pairing because this machine's own user clicked Approve.
+
+    The click is the intent, so nothing has to be read out and no code reaches
+    the requester. That makes this path stronger than confirming a code: flooding
+    requests cannot produce a pairing, because approving one is an action only
+    this machine's user can take.
+
+    Local user only, and that check comes first so the response cannot be used to
+    probe which request ids exist.
+    """
+    if not _is_local_user(request):
+        raise HTTPException(
+            403, "approving a pairing requires this machine's own user")
+    _sweep_sessions(request)
+    pairing = request.app.state.pairing
+    try:
+        granted = pairing.approve(request_id, _caller(request))
+    except LookupError as error:
+        # Expired and already-approved ids land here too, so the 404 does not
+        # double as a "that request existed once" oracle.
+        raise HTTPException(404, str(error)) from error
+    request.app.state.logger.info(
+        "PAIRING APPROVED device_id=%s granted_by=%s method=%s",
+        granted.device_id, granted.granted_by, granted.method)
+    return {"status": "paired", "pairing": granted.public()}
+
+
+@router.get("/api/pairing/pending")
+async def list_pending_pairings(request: Request):
+    """Pending pairing requests with their codes, for display at the destination.
+
+    Restricted to this machine's own user: a browser session registered from
+    loopback, or the local CLI token. A peer on the LAN has no local session, so
+    it can create a request (and see only that it did) but can never read the
+    code that request generated - which is what keeps ``/pair/confirm`` a real
+    proof of intent rather than a formality.
+    """
+    if not _is_local_user(request):
+        raise HTTPException(
+            403, "pending pairing codes are only shown to this machine's own user")
+    _sweep_sessions(request)
+    return {"requests": request.app.state.pairing.reveal_pending()}
+
+
+@router.post("/api/devices/{device_id}/pair/confirm")
+async def confirm_pairing(device_id: str, payload: PairingConfirmBody,
+                          request: Request):
+    """Exchange a code for a pairing."""
+    if device_id != payload.device_id:
+        raise HTTPException(422, "device_id in the path and body must match")
+    registry, _ = _services(request)
+    if not registry.get(device_id):
+        raise HTTPException(404, "device is unavailable")
+    pairing = request.app.state.pairing
+    try:
+        granted = pairing.confirm(device_id, _caller(request), payload.code)
+    except LookupError as error:
+        raise HTTPException(404, str(error)) from error
+    except PermissionError as error:
+        # 403 rather than 401: the caller is identified, they just cannot prove
+        # intent for this device. No hint about which codes exist is given.
+        raise HTTPException(403, str(error)) from error
+    request.app.state.logger.info(
+        "PAIRING CONFIRMED device_id=%s granted_by=%s method=%s",
+        device_id, granted.granted_by, granted.method)
+    return {"status": "paired", "pairing": granted.public()}
+
+
 @router.post("/api/devices/{device_id}/pair")
 async def pair_device(device_id: str, request: Request):
+    """Pair a device, given proof of intent.
+
+    Two callers are trusted, and no others:
+
+    * the local CLI, via the token only a process on this machine can read; and
+    * a browser session registered *from this machine* - the user is looking at
+      the destination in this interface and clicking is the explicit interaction.
+
+    Requiring the local session specifically matters. Registration is
+    unauthenticated, so a peer can obtain a session token for free; accepting any
+    session here would let a device on the LAN pair any device, which is precisely
+    the hole the pairing code was introduced to close.
+
+    Anyone else gets 403 and must read a code off the destination's screen.
+    """
     registry, _ = _services(request)
     device = registry.get(device_id)
     if not device:
         raise HTTPException(404, "device is unavailable")
-    request.app.state.paired_devices.add(device_id)
-    return {"status": "paired", "device": device.public()}
+    if not _is_local_user(request):
+        raise HTTPException(
+            403,
+            "pairing requires this machine's own user or a pairing code; "
+            "request one with POST /api/devices/{id}/pair/request")
+    granted = request.app.state.pairing.grant_directly(
+        device_id, _caller(request), "session")
+    request.app.state.logger.info(
+        "PAIRING GRANTED device_id=%s granted_by=%s method=%s",
+        device_id, granted.granted_by, granted.method)
+    return {"status": "paired", "device": device.public(),
+            "pairing": granted.public()}
 
 
 @router.delete("/api/devices/{device_id}/pair")
 async def unpair_device(device_id: str, request: Request):
-    request.app.state.paired_devices.discard(device_id)
+    """Revoke a pairing.
+
+    Local user only. Allowing any session here would let a peer revoke pairings
+    and so deny the user the ability to send, which needs no credential worth
+    stealing - a self-registered session is enough.
+    """
+    if not _is_local_user(request):
+        raise HTTPException(403, "unpairing requires this machine's own user")
+    request.app.state.pairing.unpair(device_id)
+    request.app.state.logger.info("PAIRING REVOKED device_id=%s", device_id)
     return {"status": "unpaired", "device_id": device_id}
 
 
@@ -404,11 +771,19 @@ async def create_transfer(payload: TransferCreate, request: Request):
     registry, transfers = _services(request)
     if not registry.get(payload.receiver_id):
         raise HTTPException(404, "destination device is unavailable")
-    if payload.receiver_id not in request.app.state.paired_devices:
-        raise HTTPException(403, "pair with the destination device first")
+    if not request.app.state.pairing.is_paired(payload.receiver_id):
+        raise HTTPException(
+            403,
+            "pair with the destination device first: request a code with "
+            "POST /api/devices/{id}/pair/request and confirm it")
     try:
-        sender_id = _session_device_id(
-            request) or registry.local_device.device_id
+        sender_id = _caller(request)
+        if not sender_id:
+            # Falling back to the local device here let any anonymous peer create a
+            # transfer *as this machine*, which put a forged sender in the victim's
+            # history and hands out an upload token for it.
+            raise HTTPException(
+                401, "a browser session or the local CLI token is required")
         if sender_id == payload.receiver_id:
             raise HTTPException(400, "sender and receiver must differ")
         sender = registry.get(sender_id) or registry.local_device
@@ -436,11 +811,18 @@ async def create_transfer(payload: TransferCreate, request: Request):
 async def list_transfers(request: Request):
     """Return only the transfers the calling device participates in."""
     caller = _caller(request)
+    if not caller:
+        raise HTTPException(
+            401, "a browser session or the local CLI token is required")
     return {"transfers": request.app.state.history.list_for(caller)}
 
 
 async def _clear_transfer_history(request: Request):
-    request.app.state.history.clear_for(_caller(request))
+    caller = _caller(request)
+    if not caller:
+        raise HTTPException(
+            401, "a browser session or the local CLI token is required")
+    request.app.state.history.clear_for(caller)
     return {"status": "cleared"}
 
 
@@ -457,19 +839,32 @@ async def clear_transfer_history_compat(request: Request):
 
 @router.post("/api/incoming-transfers")
 async def receive_transfer_request(payload: IncomingTransfer, request: Request):
+    """Accept a transfer announced by a peer.
+
+    Reachable without authentication, because a remote sender has no session on
+    this server. That is why the pending count is capped and why every field is
+    validated: an anonymous peer gets to create bounded, well-formed, inert
+    records, and nothing more. It cannot read them back, accept them, or upload
+    bytes without a token it chose and must present.
+    """
     registry, transfers = _services(request)
-    if payload.sender.get("device_id") == registry.local_device.device_id:
+    sender = payload.sender.model_dump()
+    if sender["device_id"] == registry.local_device.device_id:
         raise HTTPException(400, "sender and receiver must differ")
     if payload.total_bytes != sum(file.size for file in payload.files):
         raise HTTPException(422, "total_bytes does not match file metadata")
     try:
-        existing = transfers.transfers.get(payload.transfer_id)
+        existing = transfers.get_or_none(payload.transfer_id)
         authenticated_sender = _session_device_id(request)
         if (existing and authenticated_sender and
                 existing.get("sender_id") == authenticated_sender):
             receiver_id = existing["receiver_id"]
         else:
             receiver_id = _effective_receiver_id(request, payload.receiver_id)
+        # Anonymous callers may not name a receiver, or they could aim pending
+        # transfers at whichever device they choose. A session may.
+        if not authenticated_sender and payload.receiver_id:
+            receiver_id = registry.local_device.device_id
         request.app.state.logger.info(
             "INCOMING REQUEST transfer_id=%s authenticated_receiver=%s "
             "payload_receiver=%s stored_receiver=%s",
@@ -477,7 +872,7 @@ async def receive_transfer_request(payload: IncomingTransfer, request: Request):
                 request), payload.receiver_id,
             existing.get("receiver_id") if existing else receiver_id)
         if existing:
-            if (existing.get("sender_id") == payload.sender.get("device_id")
+            if (existing.get("sender_id") == sender["device_id"]
                     and existing.get("receiver_id") == receiver_id):
                 result = transfers.public(existing)
                 result["direction"] = "incoming"
@@ -486,10 +881,11 @@ async def receive_transfer_request(payload: IncomingTransfer, request: Request):
                 409, "transfer already exists for a different receiver context")
         if receiver_id != registry.local_device.device_id and not registry.get(receiver_id):
             raise HTTPException(404, "receiver device is unavailable")
-        created = transfers.create(payload.sender["device_id"], receiver_id,
+        _enforce_pending_cap(request, receiver_id)
+        created = transfers.create(sender["device_id"], receiver_id,
                                    [file.model_dump()
                                     for file in payload.files], "incoming",
-                                   payload.transfer_id, payload.sender,
+                                   payload.transfer_id, sender,
                                    payload.transport, payload.token)
         created["direction"] = "incoming"
         return created
@@ -497,10 +893,32 @@ async def receive_transfer_request(payload: IncomingTransfer, request: Request):
         raise HTTPException(422, str(error)) from error
 
 
+def _enforce_pending_cap(request: Request, receiver_id: str) -> None:
+    """Refuse unbounded pending announcements.
+
+    Every one of these is an unauthenticated write that also touches SQLite, so
+    without a cap a single peer can fill the disk with history rows.
+    """
+    settings = request.app.state.settings
+    pending = sum(
+        1 for transfer in request.app.state.transfers.transfers.values()
+        if transfer.get("receiver_id") == receiver_id
+        and transfer.get("status") == "PENDING"
+    )
+    if pending >= settings.max_pending_incoming:
+        raise HTTPException(
+            429,
+            f"too many pending incoming transfers (limit "
+            f"{settings.max_pending_incoming}); accept or reject one first")
+
+
+
 @router.get("/api/incoming-transfers")
 async def list_incoming_transfers(request: Request):
-    receiver_id = _session_device_id(
-        request) or request.app.state.registry.local_device.device_id
+    receiver_id = _caller(request)
+    if not receiver_id:
+        raise HTTPException(
+            401, "a browser session or the local CLI token is required")
     transfers = []
     for item in request.app.state.transfers.transfers.values():
         if item.get("receiver_id") != receiver_id:
@@ -618,10 +1036,11 @@ async def download_incoming_file(transfer_id: str, index: int, request: Request)
     _assert_receiver_authorized(request, transfer)
     if index < 0 or index >= len(transfer["files"]):
         raise HTTPException(404, "file not found")
-    received = transfer.get("received_files") or []
-    if index >= len(received):
+    received = transfer.get("received_files") or {}
+    stored = received.get(str(index))
+    if stored is None:
         raise HTTPException(404, "file has not been received yet")
-    path = Path(str(received[index]))
+    path = Path(str(stored))
     # Defend against a stale or tampered record pointing outside the download
     # tree, even though nothing should write one.
     try:
@@ -629,7 +1048,7 @@ async def download_incoming_file(transfer_id: str, index: int, request: Request)
         root = request.app.state.transfers.download_root.resolve()
     except OSError as error:
         raise HTTPException(500, "stored file is unreadable") from error
-    if root not in resolved.parents:
+    if not resolved.is_relative_to(root):
         raise HTTPException(400, "invalid stored file path")
     if not resolved.is_file():
         raise HTTPException(404, "file has been removed from the server")

@@ -16,15 +16,12 @@ from seltransfer.devices import Device
 from seltransfer.server.app import create_app
 from seltransfer.storage import HistoryStore
 from seltransfer.transfers import TransferManager
+from tests.conftest import make_app, pair
 
 
 @pytest.fixture
 def app(tmp_path):
-    application = create_app(server_port=8790, local_address="127.0.0.1")
-    application.state.history = HistoryStore(tmp_path / "history.db")
-    application.state.transfers = TransferManager(
-        tmp_path / "downloads", application.state.history)
-    return application
+    return make_app(tmp_path, port=8790)
 
 
 @pytest.fixture
@@ -48,7 +45,7 @@ def test_pc_to_phone_over_http_end_to_end(client, app):
     """The full default path, exactly as the browser client drives it."""
     sender = register(client, "pc-browser-sender", "Workstation")
     phone = register(client, "phone-browser-receiver", "Pixel")
-    client.app.state.paired_devices.add("phone-browser-receiver")
+    pair(client.app, "phone-browser-receiver")
 
     payload = b"the actual file contents\n" * 64
     metadata = {
@@ -107,7 +104,7 @@ def test_phone_can_resume_polling_until_the_upload_lands(client):
     """The phone must be able to see progress before it can download anything."""
     sender = register(client, "pc-poller", "Workstation")
     phone = register(client, "phone-poller", "Pixel")
-    client.app.state.paired_devices.add("phone-poller")
+    pair(client.app, "phone-poller")
     metadata = {"name": "a.bin", "size": 4,
                 "sha256": hashlib.sha256(b"data").hexdigest()}
     created = client.post(
@@ -141,7 +138,7 @@ def test_sender_cannot_download_the_phone_copy(client):
     """The download endpoint is for the receiver, not the sender."""
     sender = register(client, "pc-nosy-device", "Workstation")
     phone = register(client, "phone-target", "Pixel")
-    client.app.state.paired_devices.add("phone-target")
+    pair(client.app, "phone-target")
     metadata = {"name": "secret.txt", "size": 6,
                 "sha256": hashlib.sha256(b"secret").hexdigest()}
     created = client.post(
@@ -189,7 +186,12 @@ def _set_local_device_id(app, device_id):
     registry._devices.pop(previous, None)
     registry.local_device.device_id = device_id
     registry._devices[device_id] = registry.local_device
-    app.state.paired_devices = {device_id}
+    pair(app, device_id)
+
+
+def _local(app):
+    """Headers that identify this server's own CLI, as `seltransfer` would send."""
+    return {"x-seltransfer-local": app.state.local_token}
 
 
 def test_push_token_from_a_native_sender_is_honoured(tmp_path):
@@ -202,12 +204,14 @@ def test_push_token_from_a_native_sender_is_honoured(tmp_path):
     sender_app, receiver_app = _two_server_pair(tmp_path)
     sender_client = TestClient(sender_app)
     receiver_client = TestClient(receiver_app)
+    sender_headers = _local(sender_app)
+    receiver_headers = _local(receiver_app)
 
     peer = receiver_app.state.registry.local_device.device_id
     sender_app.state.registry.upsert(
         Device(device_id=peer, name="Native PC", type="computer",
                ip="127.0.0.1", port=8793, node_type="server"))
-    sender_app.state.paired_devices.add(peer)
+    pair(sender_app, peer)
 
     payload = b"native bytes"
     metadata = {"name": "from-cli.bin", "size": len(payload),
@@ -215,7 +219,8 @@ def test_push_token_from_a_native_sender_is_honoured(tmp_path):
     token = "cli-supplied-upload-token-value"
 
     created = sender_client.post(
-        "/api/transfers", json={"receiver_id": peer, "files": [metadata]})
+        "/api/transfers", json={"receiver_id": peer, "files": [metadata]},
+        headers=sender_headers)
     assert created.status_code == 200, created.text
     transfer = created.json()
 
@@ -229,7 +234,8 @@ def test_push_token_from_a_native_sender_is_honoured(tmp_path):
     assert announced.status_code == 200, announced.text
 
     accepted = receiver_client.post(
-        f"/api/incoming-transfers/{transfer['transfer_id']}/accept")
+        f"/api/incoming-transfers/{transfer['transfer_id']}/accept",
+        headers=receiver_headers)
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["status"] == "ACCEPTED"
 
@@ -250,21 +256,25 @@ def test_announcement_with_wrong_token_cannot_push(tmp_path):
     sender_app, receiver_app = _two_server_pair(tmp_path)
     sender_client = TestClient(sender_app)
     receiver_client = TestClient(receiver_app)
+    sender_headers = _local(sender_app)
+    receiver_headers = _local(receiver_app)
     peer = receiver_app.state.registry.local_device.device_id
     sender_app.state.registry.upsert(
         Device(device_id=peer, name="Native PC", type="computer",
                ip="127.0.0.1", port=8793, node_type="server"))
-    sender_app.state.paired_devices.add(peer)
+    pair(sender_app, peer)
 
     metadata = {"name": "x.bin", "size": 4, "sha256": None}
     created = sender_client.post(
-        "/api/transfers", json={"receiver_id": peer, "files": [metadata]}).json()
+        "/api/transfers", json={"receiver_id": peer, "files": [metadata]},
+        headers=sender_headers).json()
     receiver_client.post("/api/incoming-transfers",
                          json={"transfer_id": created["transfer_id"],
                                "sender": created["sender"], "files": [metadata],
                                "total_bytes": 4,
                                "token": "the-real-token-value-here"})
-    receiver_client.post(f"/api/incoming-transfers/{created['transfer_id']}/accept")
+    receiver_client.post(f"/api/incoming-transfers/{created['transfer_id']}/accept",
+                         headers=receiver_headers)
 
     bad = receiver_client.put(
         f"/api/incoming-transfers/{created['transfer_id']}/files/0",
@@ -278,25 +288,31 @@ def test_sender_cannot_read_the_token_from_another_server(tmp_path):
     sender_app, receiver_app = _two_server_pair(tmp_path)
     sender_client = TestClient(sender_app)
     receiver_client = TestClient(receiver_app)
+    sender_headers = _local(sender_app)
+    receiver_headers = _local(receiver_app)
     peer = receiver_app.state.registry.local_device.device_id
     sender_app.state.registry.upsert(
         Device(device_id=peer, name="Native PC", type="computer",
                ip="127.0.0.1", port=8793, node_type="server"))
-    sender_app.state.paired_devices.add(peer)
+    pair(sender_app, peer)
 
     metadata = {"name": "y.bin", "size": 2, "sha256": None}
     created = sender_client.post(
-        "/api/transfers", json={"receiver_id": peer, "files": [metadata]}).json()
+        "/api/transfers", json={"receiver_id": peer, "files": [metadata]},
+        headers=sender_headers).json()
     receiver_client.post("/api/incoming-transfers",
                          json={"transfer_id": created["transfer_id"],
                                "sender": created["sender"], "files": [metadata],
                                "total_bytes": 2,
                                "token": "the-real-token-value-here"})
-    receiver_client.post(f"/api/incoming-transfers/{created['transfer_id']}/accept")
+    receiver_client.post(f"/api/incoming-transfers/{created['transfer_id']}/accept",
+                         headers=receiver_headers)
 
-    # Unauthenticated on the destination, the caller is the destination's own
-    # node, not the sender, so no token is disclosed.
+    # Anonymous on the destination the caller has no identity at all, which is
+    # stronger than the old behaviour: it used to be treated as the destination's
+    # own node, and the token was withheld only by an explicit check. Now the
+    # request never gets far enough to consider disclosing anything.
     state = receiver_client.get(
         f"/api/incoming-transfers/{created['transfer_id']}")
-    assert state.status_code == 200
-    assert "transfer_token" not in state.json()
+    assert state.status_code == 401
+    assert "transfer_token" not in state.text

@@ -158,8 +158,8 @@ async def test_matching_digest_completes_and_verifies(manager):
                                         transfer["token"])
     assert result["status"] == "VERIFIED"
     written = manager.get(transfer["transfer_id"])["received_files"]
-    assert len(written) == 1
-    assert (manager.download_root / written[0]).read_bytes() == payload
+    assert list(written) == ["0"]
+    assert (manager.download_root / written["0"]).read_bytes() == payload
 
 
 @pytest.mark.asyncio
@@ -205,3 +205,58 @@ def test_completed_can_only_be_verified(manager):
     manager.update_state(tid, "ACCEPTED")
     with pytest.raises(ValueError, match="cannot transition"):
         manager.update_state(tid, "REJECTED")
+
+
+# --- the tracked-transfer table is a real bound ------------------------------
+#
+# Eviction alone is not a bound. It only reclaims *finished* transfers, so a peer
+# that keeps transfers alive pushes the table past `max_tracked` and the setting
+# quietly stops being a limit. Creation has to refuse instead.
+
+
+@pytest.fixture
+def bounded(tmp_path):
+    return TransferManager(tmp_path / "downloads", HistoryStore(tmp_path / "h.db"),
+                           max_tracked=3)
+
+
+def test_the_table_stops_at_the_bound_when_everything_is_live(bounded):
+    for index in range(3):
+        bounded.create("s", "r", [{"name": f"f{index}", "size": 1}])
+
+    with pytest.raises(ValueError, match="too many transfers"):
+        bounded.create("s", "r", [{"name": "one-too-many", "size": 1}])
+
+    assert len(bounded.transfers) == 3
+
+
+def test_room_reappears_once_a_transfer_finishes(bounded):
+    """Refusing must not deadlock the server."""
+    for index in range(3):
+        bounded.create("s", "r", [{"name": f"f{index}", "size": 1}])
+    oldest = next(iter(bounded.transfers))
+    bounded.update_state(oldest, "CANCELLED")
+
+    replacement = bounded.create("s", "r", [{"name": "fresh", "size": 1}])
+    assert replacement["transfer_id"] in bounded.transfers
+    assert len(bounded.transfers) == 3
+
+
+def test_a_finished_transfer_is_reclaimed_in_preference_to_refusing(bounded):
+    """At the cap with something finished, admit and evict rather than refuse."""
+    for index in range(3):
+        bounded.create("s", "r", [{"name": f"f{index}", "size": 1}])
+    finished = next(iter(bounded.transfers))
+    bounded.update_state(finished, "CANCELLED")  # terminal, and therefore evictable
+
+    admitted = bounded.create("s", "r", [{"name": "next", "size": 1}])
+
+    assert admitted["transfer_id"] in bounded.transfers
+    assert len(bounded.transfers) == 3
+    assert finished not in bounded.transfers
+
+
+def test_the_bound_is_ignored_when_unset(manager):
+    for index in range(50):
+        manager.create("s", "r", [{"name": f"f{index}", "size": 1}])
+    assert len(manager.transfers) == 50

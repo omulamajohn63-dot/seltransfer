@@ -171,6 +171,8 @@ class SeltransferApp {
         this.$("send-folder").addEventListener("click", () => this.$("folder-input").click());
         this.$("file-input").addEventListener("change", (event) => this.send(event.target.files));
         this.$("folder-input").addEventListener("change", (event) => this.send(event.target.files));
+        const approvalRequest = this.$("pair-approval-request");
+        if (approvalRequest) approvalRequest.addEventListener("click", () => this.requestApproval());
         const transportToggle = this.$("transport-mode");
         if (transportToggle) {
             transportToggle.value = this.transport;
@@ -197,7 +199,11 @@ class SeltransferApp {
             }
             if (!response.ok) {
                 const body = await response.json().catch(() => ({}));
-                throw new Error(body.detail || `Request failed (${response.status})`);
+                const error = new Error(body.detail || `Request failed (${response.status})`);
+                // The status is needed to tell "not allowed, ask for a code" apart
+                // from a genuine failure.
+                error.status = response.status;
+                throw error;
             }
             // Binary callers (file downloads) need the Response itself.
             if (raw) return response;
@@ -216,8 +222,11 @@ class SeltransferApp {
             this.$("network").textContent = `${connection.local_address}:${connection.server_port}`;
             await this.registerBrowser(connection.device_id);
             this.$("storage-location").textContent = `Native files received by this server are saved in: ${connection.download_directory}. Browser receivers download files using their own browser settings.`;
-            await this.loadDevices(); await this.loadIncoming(); await this.loadHistory();
+            await this.loadDevices(); await this.loadIncoming(); await this.loadHistory(); await this.loadPendingPairings();
             setInterval(() => this.heartbeat(), 7000); setInterval(() => this.loadDevices(), 4000); setInterval(() => this.loadIncoming(), 4000);
+            // Codes live for two minutes, so the local user's panel refreshes often
+            // enough that a code is on screen before the other device asks for it.
+            setInterval(() => this.loadPendingPairings(), 4000);
             // A backgrounded phone has its timers throttled or suspended, so the
             // session expires while the user is elsewhere. Renew on return so an
             // incoming transfer is not waiting for a device that looks offline.
@@ -288,6 +297,9 @@ class SeltransferApp {
         try {
             const data = await this.api("/api/devices");
             this.serverDeviceId = data.local_device_id || this.serverDeviceId;
+            // Whether this browser is the machine's own user decides how pairing
+            // works here: one click if so, otherwise an out-of-band code.
+            if (typeof data.local_user === "boolean") this.localUser = data.local_user;
             // Exclude this browser and the server hosting the page. Selecting the
             // local server would create a transfer the page itself can never
             // accept, because the receiver is a different device than the sender.
@@ -321,8 +333,96 @@ class SeltransferApp {
         });
     }
     async select(device) {
-        this.selected = device; this.renderDevices(); this.$("destination").textContent = device.display_name || device.name; this.$("selection-note").textContent = `${device.device_type || device.type || "Computer"} · ${device.status}`; this.$("send-files").disabled = false; this.$("send-folder").disabled = false;
-        try { await this.api(`/api/devices/${device.device_id}/pair`, { method: "POST" }); this.$("pair-status").textContent = "Paired"; } catch (error) { this.$("pair-status").textContent = error.message; this.$("send-files").disabled = true; this.$("send-folder").disabled = true; }
+        this.selected = device; this.renderDevices(); this.$("destination").textContent = device.display_name || device.name; this.$("selection-note").textContent = `${device.device_type || device.type || "Computer"} · ${device.status}`;
+        this.hideApprovalRequest();
+        try {
+            await this.api(`/api/devices/${device.device_id}/pair`, { method: "POST" });
+            this.$("pair-status").textContent = "Paired";
+            this.$("send-files").disabled = false; this.$("send-folder").disabled = false;
+        } catch (error) {
+            // One-click pairing is this machine's own user only. A browser on
+            // another device has to ask this machine's user to approve it, so offer
+            // that instead of just failing.
+            this.$("send-files").disabled = true; this.$("send-folder").disabled = true;
+            if (error.status === 403 && this.localUser === false) {
+                this.$("pair-status").textContent = "Needs the user of this machine";
+                this.showApprovalRequest();
+            } else { this.$("pair-status").textContent = error.message; }
+        }
+    }
+    showApprovalRequest() { const box = this.$("pair-approval"); if (box) box.hidden = false; }
+    hideApprovalRequest() { const box = this.$("pair-approval"); if (box) box.hidden = true; }
+    async requestApproval() {
+        if (!this.selected) return;
+        this.$("pair-status").textContent = "Waiting for the user of this machine...";
+        try {
+            const data = await this.api(`/api/devices/${this.selected.device_id}/pair/request`, { method: "POST", body: JSON.stringify({ device_id: this.selected.device_id }) });
+            // The requester is never told the code - that would make the whole flow
+            // self-service. It waits for the destination's user to approve instead.
+            this.$("pair-status").textContent = "Requested. The user of this machine has to approve it.";
+            this.awaitingApproval = data.request_id || null;
+            this.startApprovalPoll();
+        } catch (error) { this.$("pair-status").textContent = error.message; }
+    }
+    // After requesting, poll for the pairing appearing. Approval happens on the
+    // other device's screen, so this is how the requester learns it succeeded
+    // without ever being sent the code.
+    startApprovalPoll() {
+        if (this.approvalTimer) return;
+        this.approvalTimer = setInterval(() => this.checkApproval(), 2000);
+    }
+    stopApprovalPoll() { if (this.approvalTimer) { clearInterval(this.approvalTimer); this.approvalTimer = null; } this.awaitingApproval = null; }
+    async checkApproval() {
+        const deviceId = this.selected?.device_id;
+        if (!this.awaitingApproval || !deviceId) { this.stopApprovalPoll(); return; }
+        try {
+            const state = await this.api(`/api/pairing/status/${deviceId}`);
+            if (state.paired) {
+                this.stopApprovalPoll();
+                this.$("pair-status").textContent = "Paired";
+                this.$("send-files").disabled = false; this.$("send-folder").disabled = false;
+                this.hideApprovalRequest();
+            }
+        } catch (error) {
+            // A destination that went away must not leave the poll running forever.
+            if (error.status === 404) { this.stopApprovalPoll(); this.$("pair-status").textContent = "destination device is unavailable"; }
+        }
+    }
+    // The local user's side of pairing: approve what a remote device asked for.
+    // This is the whole flow now - there is no code to read out or type in.
+    async approvePairing(requestId) {
+        try {
+            await this.api(`/api/pairing/requests/${requestId}/approve`, { method: "POST" });
+            await this.loadPendingPairings();
+            await this.loadDevices();
+        } catch (error) { this.showError(error.message); }
+    }
+    async loadPendingPairings() {
+        if (this.localUser !== true) return;
+        const panel = this.$("pairing-panel");
+        if (panel) panel.hidden = false;
+        try {
+            const data = await this.api("/api/pairing/pending");
+            const list = this.$("pairing-pending"); if (!list) return;
+            list.replaceChildren();
+            if (!data.requests.length) { list.textContent = "No pending requests."; return; }
+            data.requests.forEach((entry) => {
+                const row = document.createElement("div"); row.className = "pairing-row";
+                // Who is asking, so the user can judge it before clicking. The code
+                // is deliberately not rendered: there is no field to type it into any
+                // more, and a big readable code next to an Approve button only
+                // invites reading it out for no purpose. It stays available through
+                // `GET /api/pairing/pending` for API callers.
+                const who = document.createElement("span"); who.className = "pairing-requester"; who.textContent = entry.device_id.slice(0, 8);
+                const meta = document.createElement("small"); meta.textContent = `expires in ${entry.seconds_remaining}s`;
+                // The click is the intent, so the other device never has to read a
+                // code out. This panel only renders for the local user (see the
+                // guard above), so a LAN peer can neither see nor press it.
+                const approve = document.createElement("button"); approve.type = "button"; approve.className = "pairing-approve"; approve.textContent = "Approve";
+                approve.addEventListener("click", () => this.approvePairing(entry.request_id));
+                row.append(who, meta, approve); list.append(row);
+            });
+        } catch (error) { /* the panel is informational; never let it break the page */ }
     }
     clearSelection() { this.selected = null; this.$("destination").textContent = "Choose a device"; this.$("selection-note").textContent = "Select an online device before sending."; this.$("send-files").disabled = true; this.$("send-folder").disabled = true; this.renderDevices(); }
     async send(files) {
@@ -461,7 +561,10 @@ class SeltransferApp {
         for (;;) {
             const state = await this.api(`/api/incoming-transfers/${transfer.transfer_id}`);
             if (state.status === "FAILED" || state.status === "CANCELLED") throw new Error(`Transfer ${state.status.toLowerCase()}: ${state.error || "unknown reason"}`);
-            const receivedCount = (state.received_files || []).length;
+            // received_files is an object keyed by file index, not an array, so
+            // .length is undefined. Counting keys reports what actually landed,
+            // which a loop over the expected count would not.
+            const receivedCount = Object.keys(state.received_files || {}).length;
             if (receivedCount >= expected) break;
             if (Date.now() > deadline) throw new Error("Timed out waiting for the sender to upload the files.");
             this.setStatus(`Waiting for the sender to upload · ${receivedCount}/${expected}`);

@@ -319,6 +319,51 @@ a:focus-visible {
     background: var(--paper);
 }
 
+/* --- approval request -------------------------------------------------------
+   The remote device can only ask; this machine's user has to accept. */
+
+.pair-approval {
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px dashed var(--line);
+}
+
+.pair-approval-hint {
+    margin: 0 0 10px;
+    font-size: 13px;
+    color: var(--muted);
+    max-width: 60ch;
+}
+
+.pair-approval-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.pairing-panel { margin: 32px 0; }
+
+.pairing-pending { display: flex; flex-direction: column; gap: 10px; }
+
+.pairing-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 12px;
+    padding: 14px 16px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+}
+
+.pairing-requester {
+    font: 700 20px var(--mono);
+    letter-spacing: 1px;
+    color: var(--ink);
+}
+
+.pairing-row small { color: var(--muted); }
+
 .actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 
 .transport-toggle {

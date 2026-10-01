@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from seltransfer.devices import resolve_device_display_name, validate_device_name
 from seltransfer.server.app import create_app
 from seltransfer.storage import HistoryStore
-from seltransfer.transfers import TransferManager
+from tests.conftest import make_app, pair
 
 
 @pytest.fixture
@@ -19,11 +19,7 @@ def client(tmp_path):
     Without this the suite wrote device-id, history rows, and received files into
     the developer's own ~/.seltransfer.
     """
-    app = create_app(server_port=8765, local_address="127.0.0.1")
-    history = HistoryStore(tmp_path / "history.db")
-    app.state.history = history
-    app.state.transfers = TransferManager(tmp_path / "downloads", history)
-    return TestClient(app)
+    return TestClient(make_app(tmp_path))
 
 
 def test_get_status(client):
@@ -135,7 +131,7 @@ def test_browser_transfer_uses_browser_as_sender(client):
     session = client.post("/api/browser/register", json=payload).json()
     headers = {"x-seltransfer-session": session["session_id"]}
     receiver_id = client.app.state.registry.local_device.device_id
-    client.app.state.paired_devices.add(receiver_id)
+    pair(client.app, receiver_id)
     metadata = {"name": "report.txt", "size": 4}
 
     response = client.post("/api/transfers", json={"receiver_id": receiver_id,
@@ -171,7 +167,8 @@ def test_get_connection_info(client):
     assert "server_port" in data
 
 
-def test_clear_transfer_history_does_not_remove_downloads(client, tmp_path):
+def test_clear_transfer_history_does_not_remove_downloads(client, tmp_path,
+                                                         local_headers):
     client.app.state.history = HistoryStore(tmp_path / "history.db")
     received = tmp_path / "downloads" / "report.txt"
     received.parent.mkdir(parents=True, exist_ok=True)
@@ -186,18 +183,19 @@ def test_clear_transfer_history_does_not_remove_downloads(client, tmp_path):
         "total_bytes": 8,
         "status": "VERIFIED",
     })
-    assert [item["transfer_id"] for item in
-            client.get("/api/transfers").json()["transfers"]] == ["history-test"]
+    assert [item["transfer_id"] for item in client.get(
+        "/api/transfers", headers=local_headers).json()["transfers"]] == ["history-test"]
 
-    cleared = client.delete("/api/transfers/history")
+    cleared = client.delete("/api/transfers/history", headers=local_headers)
 
     assert cleared.status_code == 200
-    assert client.get("/api/transfers").json()["transfers"] == []
+    assert client.get(
+        "/api/transfers", headers=local_headers).json()["transfers"] == []
     assert received.read_bytes() == b"received"
 
 
-def test_clear_transfer_history_post_compatibility(client):
-    response = client.post("/api/transfers/history/clear")
+def test_clear_transfer_history_post_compatibility(client, local_headers):
+    response = client.post("/api/transfers/history/clear", headers=local_headers)
 
     assert response.status_code == 200
     assert response.json() == {"status": "cleared"}
@@ -233,23 +231,22 @@ def test_created_at_is_preserved_across_state_changes(client, tmp_path):
 
 
 def test_two_nodes_negotiate_and_receive_bytes(tmp_path):
-    sender = create_app(server_port=8765, local_address="127.0.0.1")
-    receiver = create_app(server_port=8767, local_address="127.0.0.1")
-    sender.state.transfers = TransferManager(
-        tmp_path / "sender", HistoryStore(tmp_path / "sender.db"))
-    receiver.state.transfers = TransferManager(
-        tmp_path / "receiver", HistoryStore(tmp_path / "receiver.db"))
+    sender = make_app(tmp_path, port=8765)
+    receiver = make_app(tmp_path, port=8767)
+    sender_headers = {"x-seltransfer-local": sender.state.local_token}
+    receiver_headers = {"x-seltransfer-local": receiver.state.local_token}
     sender.state.registry.local_device.device_id = "sender-id"
     receiver.state.registry.local_device.device_id = "receiver-id"
     sender.state.registry.upsert(receiver.state.registry.local_device)
-    sender.state.paired_devices.add("receiver-id")
+    pair(sender, "receiver-id")
     sender_client, receiver_client = TestClient(sender), TestClient(receiver)
     content = b"direct device-to-device bytes"
     metadata = {"name": "folder/report.txt", "size": len(content),
                 "sha256": hashlib.sha256(content).hexdigest()}
 
     created = sender_client.post(
-        "/api/transfers", json={"receiver_id": "receiver-id", "files": [metadata]})
+        "/api/transfers", json={"receiver_id": "receiver-id", "files": [metadata]},
+        headers=sender_headers)
     assert created.status_code == 200
     token = "sender-supplied-upload-token-value"
     request = {"transfer_id": created.json()["transfer_id"], "sender": created.json()["sender"],
@@ -258,7 +255,8 @@ def test_two_nodes_negotiate_and_receive_bytes(tmp_path):
     assert incoming.status_code == 200
     assert incoming.json()["status"] == "PENDING"
     accepted = receiver_client.post(
-        f"/api/incoming-transfers/{request['transfer_id']}/accept")
+        f"/api/incoming-transfers/{request['transfer_id']}/accept",
+        headers=receiver_headers)
     assert accepted.json()["status"] == "ACCEPTED"
     # The receiver is not given the sender's push token.
     assert "transfer_token" not in accepted.json()
@@ -267,17 +265,16 @@ def test_two_nodes_negotiate_and_receive_bytes(tmp_path):
                                  headers={"x-seltransfer-token": token})
     assert upload.status_code == 200
     assert upload.json()["status"] == "VERIFIED"
-    received = Path(receiver.state.transfers.get(
-        request["transfer_id"])["received_files"][0])
+    received = Path(list(receiver.state.transfers.get(
+        request["transfer_id"])["received_files"].values())[0])
     assert received.read_bytes() == content
     assert hashlib.sha256(received.read_bytes()
                           ).hexdigest() == metadata["sha256"]
 
 
 def test_incoming_transfer_rejects_invalid_token(tmp_path):
-    app = create_app(server_port=8767, local_address="127.0.0.1")
-    app.state.transfers = TransferManager(
-        tmp_path, HistoryStore(tmp_path / "history.db"))
+    app = make_app(tmp_path, port=8767)
+    headers = {"x-seltransfer-local": app.state.local_token}
     client = TestClient(app)
     metadata = {"name": "report.txt", "size": 4,
                 "sha256": hashlib.sha256(b"test").hexdigest()}
@@ -287,7 +284,7 @@ def test_incoming_transfer_rejects_invalid_token(tmp_path):
     assert client.post("/api/incoming-transfers",
                        json=request).status_code == 200
     accepted = client.post(
-        "/api/incoming-transfers/transfer-token-test/accept").json()
+        "/api/incoming-transfers/transfer-token-test/accept", headers=headers).json()
     response = client.put("/api/incoming-transfers/transfer-token-test/files/0", content=b"test",
                           headers={"x-seltransfer-token": "wrong"})
     assert response.status_code == 401
@@ -295,9 +292,8 @@ def test_incoming_transfer_rejects_invalid_token(tmp_path):
 
 
 def test_incoming_transfer_can_receive_multiple_files(tmp_path):
-    app = create_app(server_port=8767, local_address="127.0.0.1")
-    app.state.transfers = TransferManager(
-        tmp_path, HistoryStore(tmp_path / "history.db"))
+    app = make_app(tmp_path, port=8767)
+    headers = {"x-seltransfer-local": app.state.local_token}
     client = TestClient(app)
     contents = [b"one", b"two"]
     files = [{"name": f"folder/file-{index}.txt", "size": len(content),
@@ -308,7 +304,7 @@ def test_incoming_transfer_can_receive_multiple_files(tmp_path):
                "files": files, "total_bytes": 6,
                "token": "multi-file-upload-token-value"}
     client.post("/api/incoming-transfers", json=request)
-    client.post("/api/incoming-transfers/transfer-multi-test/accept")
+    client.post("/api/incoming-transfers/transfer-multi-test/accept", headers=headers)
     token = request["token"]
     for index, content in enumerate(contents):
         response = client.put(
@@ -317,8 +313,10 @@ def test_incoming_transfer_can_receive_multiple_files(tmp_path):
         assert response.status_code == 200
     assert response.json()["status"] == "VERIFIED"
     received = app.state.transfers.get("transfer-multi-test")["received_files"]
-    assert Path(received[0]).read_bytes() == contents[0]
-    assert Path(received[1]).read_bytes() == contents[1]
+    # Keyed by declared index, so ordering follows the metadata rather than the
+    # order the bytes happened to arrive in.
+    assert Path(received["0"]).read_bytes() == contents[0]
+    assert Path(received["1"]).read_bytes() == contents[1]
 
 
 def test_browser_receiver_sees_pending_transfer_and_can_accept(client):
@@ -332,7 +330,7 @@ def test_browser_receiver_sees_pending_transfer_and_can_accept(client):
         json={"device_id": "browser-receiver",
               "name": "Receiver Phone", "type": "phone"},
     ).json()
-    client.app.state.paired_devices.add("browser-receiver")
+    pair(client.app, "browser-receiver")
     metadata = {"name": "notes.txt", "size": 7,
                 "sha256": hashlib.sha256(b"pending").hexdigest()}
     transfer = client.post(
@@ -387,7 +385,7 @@ def test_browser_receiver_can_reject_pending_transfer(client):
         json={"device_id": "browser-receiver-reject",
               "name": "Receiver Phone", "type": "phone"},
     ).json()
-    client.app.state.paired_devices.add("browser-receiver-reject")
+    pair(client.app, "browser-receiver-reject")
     metadata = {"name": "notes.txt", "size": 7,
                 "sha256": hashlib.sha256(b"reject").hexdigest()}
     transfer = client.post(
@@ -440,7 +438,7 @@ def test_browser_sender_uploads_to_browser_receiver_over_http(client):
         json={"device_id": "browser-receiver-upload",
               "name": "Receiver", "type": "phone"},
     ).json()
-    client.app.state.paired_devices.add("browser-receiver-upload")
+    pair(client.app, "browser-receiver-upload")
     metadata = {"name": "upload.txt", "size": 6,
                 "sha256": hashlib.sha256(b"upload").hexdigest()}
     created = client.post(
@@ -490,7 +488,7 @@ def test_browser_receiver_downloads_the_file_over_http(client):
         "/api/browser/register",
         json={"device_id": "browser-receiver-dl", "name": "Receiver", "type": "phone"},
     ).json()
-    client.app.state.paired_devices.add("browser-receiver-dl")
+    pair(client.app, "browser-receiver-dl")
     payload = b"downloaded bytes"
     metadata = {"name": "grab.txt", "size": len(payload),
                 "sha256": hashlib.sha256(payload).hexdigest()}
@@ -547,6 +545,68 @@ def test_webrtc_transfer_to_non_browser_receiver_is_refused(client):
     assert response.status_code in {404, 422}
 
 
+def test_webrtc_sessions_are_capped(tmp_path):
+    """Each session buffers signalling messages, so the table must be bounded.
+
+    `max_webrtc_sessions` existed and was never read, so a paired peer could grow
+    it without limit. At the cap the server refuses and points at HTTP rather than
+    evicting a live connection out from under someone.
+    """
+    app = make_app(tmp_path)
+    app.state.settings.max_webrtc_sessions = 2
+    client = TestClient(app)
+
+    client.post("/api/browser/register",
+                json={"device_id": "browser-peer-01", "name": "Peer", "type": "phone"})
+    sender = client.post("/api/browser/register",
+                         json={"device_id": "browser-owner-01", "name": "Owner",
+                               "type": "computer"}).json()
+    headers = {"x-seltransfer-session": sender["session_id"]}
+
+    for _ in range(2):
+        created = client.post("/api/webrtc/session",
+                              json={"peer_device_id": "browser-peer-01"},
+                              headers=headers)
+        assert created.status_code == 200, created.text
+
+    refused = client.post("/api/webrtc/session",
+                          json={"peer_device_id": "browser-peer-01"},
+                          headers=headers)
+    assert refused.status_code == 503, refused.text
+    assert "HTTP" in refused.json()["detail"]
+    assert len(app.state.webrtc_sessions) == 2
+
+
+def test_an_expired_webrtc_session_frees_its_slot(tmp_path):
+    """The cap must not deadlock the server once a session ages out."""
+    app = make_app(tmp_path)
+    app.state.settings.max_webrtc_sessions = 1
+    client = TestClient(app)
+    sender = client.post("/api/browser/register",
+                         json={"device_id": "browser-owner-02", "name": "Owner",
+                               "type": "computer"}).json()
+    client.post("/api/browser/register",
+                json={"device_id": "browser-peer-02", "name": "Peer", "type": "phone"})
+    headers = {"x-seltransfer-session": sender["session_id"]}
+
+    first = client.post("/api/webrtc/session",
+                        json={"peer_device_id": "browser-peer-02"},
+                        headers=headers)
+    assert first.status_code == 200
+    assert client.post("/api/webrtc/session",
+                       json={"peer_device_id": "browser-peer-02"},
+                       headers=headers).status_code == 503
+
+    # Age it out the way the sweeper would.
+    session_id = first.json()["session_id"]
+    app.state.webrtc_sessions[session_id]["created_at"] = 0
+
+    again = client.post("/api/webrtc/session",
+                        json={"peer_device_id": "browser-peer-02"},
+                        headers=headers)
+    assert again.status_code == 200, again.text
+
+
 def test_webrtc_upload_endpoint_refuses_http_sender(client):
     """A transfer explicitly on WebRTC must not accept a plain HTTP upload."""
     sender = client.post(
@@ -558,7 +618,7 @@ def test_webrtc_upload_endpoint_refuses_http_sender(client):
         json={"device_id": "browser-receiver-wr2",
               "name": "Receiver", "type": "phone"},
     ).json()
-    client.app.state.paired_devices.add("browser-receiver-wr2")
+    pair(client.app, "browser-receiver-wr2")
     payload = b"abc"
     metadata = {"name": "f.txt", "size": 3,
                 "sha256": hashlib.sha256(payload).hexdigest()}
@@ -598,7 +658,7 @@ def test_duplicate_incoming_request_is_idempotent(client):
         json={"device_id": "browser-receiver-dup",
               "name": "Receiver Phone", "type": "phone"},
     ).json()
-    client.app.state.paired_devices.add("browser-receiver-dup")
+    pair(client.app, "browser-receiver-dup")
     metadata = {"name": "dup.txt", "size": 3,
                 "sha256": hashlib.sha256(b"abc").hexdigest()}
     transfer = client.post(
@@ -638,7 +698,7 @@ def test_browser_sessions_cannot_access_other_browser_pending_transfers(client):
         "/api/browser/register",
         json={"device_id": "browser-bob", "name": "Bob", "type": "phone"},
     ).json()
-    client.app.state.paired_devices.add("browser-bob")
+    pair(client.app, "browser-bob")
     metadata = {"name": "secret.txt", "size": 6,
                 "sha256": hashlib.sha256(b"secret").hexdigest()}
     transfer = client.post(
@@ -705,7 +765,7 @@ def test_expired_browser_session_cannot_access_pending_transfer(client):
         json={"device_id": "browser-expired-receiver",
               "name": "Receiver", "type": "phone"},
     ).json()
-    client.app.state.paired_devices.add("browser-expired-receiver")
+    pair(client.app, "browser-expired-receiver")
     metadata = {"name": "expired.txt", "size": 1}
     created = client.post(
         "/api/transfers",
@@ -724,6 +784,8 @@ def test_expired_browser_session_cannot_access_pending_transfer(client):
         headers={"x-seltransfer-session": receiver["session_id"]},
     )
 
-    assert listed.status_code == 200
-    assert listed.json()["transfers"] == []
-    assert accepted.status_code == 403
+    assert listed.status_code == 401
+    assert accepted.status_code == 401
+    # Previously the listing answered 200 with an empty list, so a phone whose
+    # session had lapsed simply believed nothing was pending and never renewed.
+    # 401 is what the browser client watches for, so it re-registers instead.

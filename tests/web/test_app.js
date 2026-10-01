@@ -43,6 +43,7 @@ class FakeNode {
     dispatch(type, event) { (this.listeners[type] || []).forEach((handler) => handler(event || {})); }
     setAttribute(name, value) { this.attributes[name] = String(value); }
     querySelectorAll(selector) { return this.descendants().filter((node) => matches(node, selector)); }
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
     descendants() { return this.children.flatMap((child) => (child.descendants ? [child, ...child.descendants()] : [])); }
     get innerHTML() { throw new Error("innerHTML must not be used for peer-supplied values"); }
     set innerHTML(_value) { throw new Error("innerHTML must not be used for peer-supplied values"); }
@@ -236,6 +237,314 @@ test("the WebRTC wait rejects rather than hanging past its deadline", async () =
     } finally {
         clockOffset = 0;
     }
+});
+
+// --- pairing ----------------------------------------------------------------
+//
+// Pairing is the one place the client has to know *who it is*: this machine's own
+// user pairs with one click, and anything else needs a code read off the
+// destination's screen. Getting that backwards would either lock out a legitimate
+// sender or offer one-click pairing to a peer, so the branching is pinned here.
+
+function fakeApp(overrides = {}) {
+    const elements = {};
+    const app = {
+        localUser: undefined,
+        selected: null,
+        expanded: new Set(),
+        $: (id) => (elements[id] ||= new FakeNode("div")),
+        showError: () => {},
+        ...overrides,
+    };
+    return { app, elements };
+}
+
+const DEVICE = { device_id: "target-0001", display_name: "Target", device_type: "phone", status: "online" };
+
+test("a 403 on pairing offers to ask this machine's user to approve", async () => {
+    const { app } = fakeApp({ localUser: false });
+    app.renderDevices = () => {};
+    app.showApprovalRequest = () => { app.__requestShown = true; };
+    app.hideApprovalRequest = () => {};
+    const forbidden = new Error("pairing requires this machine's own user");
+    forbidden.status = 403;
+    app.api = async () => { throw forbidden; };
+
+    await extractMethod("select").call(app, DEVICE);
+
+    assert.equal(app.__requestShown, true, "the approval request must be offered");
+    assert.equal(app.$("pair-status").textContent, "Needs the user of this machine");
+    assert.equal(app.$("send-files").disabled, true, "sending stays blocked");
+});
+
+test("a local user pairs with one click and sending unlocks", async () => {
+    const { app } = fakeApp({ localUser: true });
+    app.renderDevices = () => {};
+    app.hideApprovalRequest = () => {};
+    app.api = async () => ({});
+
+    await extractMethod("select").call(app, DEVICE);
+
+    assert.equal(app.$("pair-status").textContent, "Paired");
+    assert.equal(app.$("send-files").disabled, false);
+    assert.equal(app.$("send-folder").disabled, false);
+});
+
+test("any other pairing failure reports the reason and stays blocked", async () => {
+    const { app } = fakeApp({ localUser: false });
+    app.renderDevices = () => {};
+    app.hideApprovalRequest = () => {};
+    app.showApprovalRequest = () => { app.__requestShown = true; };
+    const boom = new Error("destination device is unavailable");
+    boom.status = 404;
+    app.api = async () => { throw boom; };
+
+    await extractMethod("select").call(app, DEVICE);
+
+    assert.equal(app.__requestShown, undefined, "a 404 is not an approval case");
+    assert.equal(app.$("pair-status").textContent, "destination device is unavailable");
+    assert.equal(app.$("send-files").disabled, true);
+});
+
+test("the client no longer offers a way to type a pairing code", () => {
+    // The flow is Approve-only: the destination's user clicks, and no code is
+    // read out or entered anywhere. The endpoints still exist for API callers.
+    assert.doesNotMatch(source, /pair-code-input/, "no code input may be referenced");
+    assert.doesNotMatch(source, /submitPairingCode/, "the code submission path is gone");
+    assert.doesNotMatch(source, /pair\/confirm/, "the client must not confirm codes");
+    assert.doesNotMatch(source, /showCodeEntry|hideCodeEntry/, "the code box helpers are gone");
+});
+
+test("asking for access posts a request and says what happens next", async () => {
+    const { app } = fakeApp({ localUser: false });
+    const calls = [];
+    app.api = async (url, options) => { calls.push([url, options]); return { status: "pending", request_id: "req-1" }; };
+    app.selected = DEVICE;
+    app.startApprovalPoll = () => { app.__polling = true; };
+
+    await extractMethod("requestApproval").call(app);
+
+    assert.equal(calls[0][0], "/api/devices/target-0001/pair/request");
+    assert.match(app.$("pair-status").textContent, /approve/i);
+    assert.equal(app.awaitingApproval, "req-1");
+    assert.equal(app.__polling, true, "the requester waits for approval");
+});
+
+test("asking with no device selected does nothing", async () => {
+    const { app } = fakeApp({ localUser: false });
+    let called = false;
+    app.api = async () => { called = true; return {}; };
+
+    await extractMethod("requestApproval").call(app);
+
+    assert.equal(called, false, "nothing to ask about without a destination");
+});
+
+test("approval is detected by polling, and unlocks sending", async () => {
+    const { app } = fakeApp({ localUser: false });
+    app.hideCodeEntry = () => {};
+    app.stopApprovalPoll = extractMethod("stopApprovalPoll");
+    app.awaitingApproval = "req-1";
+    app.selected = DEVICE;
+    let polls = 0;
+    app.api = async () => { polls += 1; return { paired: true, method: "approved" }; };
+
+    await extractMethod("checkApproval").call(app);
+
+    assert.equal(polls, 1);
+    assert.equal(app.$("pair-status").textContent, "Paired");
+    assert.equal(app.$("send-files").disabled, false);
+    assert.equal(app.awaitingApproval, null, "the poll stops once paired");
+});
+
+test("an unpaired destination keeps the requester waiting", async () => {
+    const { app } = fakeApp({ localUser: false });
+    app.hideCodeEntry = () => {};
+    app.awaitingApproval = "req-1";
+    app.selected = DEVICE;
+    app.api = async () => ({ paired: false });
+    // Sends stay blocked from the failed pairing attempt that led here.
+    app.$("send-files").disabled = true;
+    app.$("send-folder").disabled = true;
+
+    await extractMethod("checkApproval").call(app);
+
+    assert.equal(app.awaitingApproval, "req-1", "still waiting");
+    assert.equal(app.$("send-files").disabled, true, "polling must not unlock sending");
+});
+
+test("a destination that disappears stops the approval poll", async () => {
+    // Otherwise the interval runs forever against a device that is gone.
+    const { app } = fakeApp({ localUser: false });
+    app.stopApprovalPoll = extractMethod("stopApprovalPoll");
+    app.awaitingApproval = "req-1";
+    app.selected = DEVICE;
+    app.api = async () => { throw Object.assign(new Error("gone"), { status: 404 }); };
+
+    await extractMethod("checkApproval").call(app);
+
+    assert.equal(app.awaitingApproval, null);
+    assert.match(app.$("pair-status").textContent, /unavailable/i);
+});
+
+test("the pending panel is only rendered for the machine's own user", async () => {
+    // A remote browser must never even try: the endpoint would refuse it, and the
+    // panel has no meaning for a device that cannot approve anything.
+    const { app } = fakeApp({ localUser: false });
+    let called = false;
+    app.api = async () => { called = true; return { requests: [] }; };
+
+    await extractMethod("loadPendingPairings").call(app);
+
+    assert.equal(called, false);
+});
+
+test("the local user's panel names the requester as text, never as markup", async () => {
+    // The panel has to identify who is asking before the user clicks Approve, and
+    // device_id is peer-supplied, so it goes in as text. The FakeNode innerHTML
+    // setter throws, so constructing the row proves it is built from nodes.
+    const { app } = fakeApp({ localUser: true });
+    const list = app.$("pairing-pending");
+    const hostile = "<img src=x onerror=alert(1)>";
+    app.api = async () => ({
+        requests: [{ request_id: "req-1", device_id: hostile, code: "48192637", seconds_remaining: 118 }],
+    });
+
+    await extractMethod("loadPendingPairings").call(app);
+
+    assert.equal(app.$("pairing-panel").hidden, false);
+    const row = list.children[0];
+    const who = row.children[0];
+    assert.equal(who.tagName, "SPAN");
+    assert.equal(who.textContent, hostile.slice(0, 8), "the id survives as literal text");
+    assert.equal(row.querySelectorAll("IMG").length, 0, "no element may come from device_id");
+    assert.ok(row.textContent.includes("118"), "the countdown is shown");
+});
+
+test("the local user's panel does not render the pairing code", async () => {
+    // There is no field to type a code into any more, so a big readable code next
+    // to an Approve button would only invite reading it out for no purpose.
+    const { app } = fakeApp({ localUser: true });
+    const list = app.$("pairing-pending");
+    app.api = async () => ({
+        requests: [{ request_id: "req-1", device_id: "target-0001", code: "48192637", seconds_remaining: 118 }],
+    });
+
+    await extractMethod("loadPendingPairings").call(app);
+
+    const row = list.children[0];
+    assert.ok(!row.textContent.includes("48192637"), "the code must not be on screen");
+    assert.equal(row.querySelector("CODE"), null, "no code element is rendered");
+});
+
+test("the local user's panel offers an Approve button per request", async () => {
+    // Approval is the primary path: the click is the intent, so the other device
+    // never has to read a code out. This panel only renders for the local user,
+    // so a peer can neither see nor press it.
+    const { app } = fakeApp({ localUser: true });
+    const list = app.$("pairing-pending");
+    app.api = async () => ({
+        requests: [{ request_id: "req-1", device_id: "target-0001", code: "48192637", seconds_remaining: 118 }],
+    });
+
+    await extractMethod("loadPendingPairings").call(app);
+
+    const button = list.children[0].querySelector("button");
+    assert.ok(button, "an Approve button must be offered");
+    assert.equal(button.textContent, "Approve");
+    assert.equal(button.type, "button");
+});
+
+test("pressing Approve posts to the approve endpoint and refreshes", async () => {
+    const { app } = fakeApp({ localUser: true });
+    const calls = [];
+    let refreshed = 0;
+    app.api = async (url, options) => {
+        calls.push([url, options]);
+        return { requests: [], status: "paired" };
+    };
+    app.loadPendingPairings = async () => { refreshed += 1; };
+    app.loadDevices = async () => { refreshed += 1; };
+
+    await extractMethod("approvePairing").call(app, "req-1");
+
+    assert.equal(calls[0][0], "/api/pairing/requests/req-1/approve");
+    assert.equal(calls[0][1].method, "POST");
+    assert.equal(refreshed, 2, "the panel and device list both refresh");
+});
+
+test("the upload progress counter counts received_files keys", async () => {
+    // received_files is an object keyed by file index, not an array, so reading
+    // .length off it yields undefined and the counter shows "undefined/1".
+    // The loop still behaved correctly - undefined >= 1 is false - which is why
+    // this only ever showed up as a wrong number on screen.
+    const { app } = fakeApp();
+    const statuses = [];
+    app.setStatus = (message) => statuses.push(message);
+    let poll = 0;
+    app.api = async () => {
+        poll += 1;
+        if (poll === 1) return { status: "PENDING", received_files: {} };
+        throw new Error("stop after the first progress message");
+    };
+
+    await assert.rejects(
+        extractMethod("receiveViaHttp").call(app, {
+            transfer_id: "transfer-01",
+            files: [{ name: "a.bin", size: 1 }],
+        }),
+        /stop after the first progress message/);
+
+    const waiting = statuses.filter((message) => /Waiting for the sender/.test(message));
+    assert.equal(waiting.length, 1);
+    assert.match(waiting[0], /0\/1/, `expected a real count, got ${JSON.stringify(waiting)}`);
+    assert.doesNotMatch(waiting[0], /undefined/);
+});
+
+test("the counter reflects files that have partly arrived", async () => {
+    // Counting keys rather than assuming 0..n-1 means a partial set is reported
+    // accurately; two of three landing shows 2/3, not 0/3.
+    const { app } = fakeApp();
+    const statuses = [];
+    app.setStatus = (message) => statuses.push(message);
+    let poll = 0;
+    app.api = async () => {
+        poll += 1;
+        if (poll === 1) return { status: "PENDING", received_files: { "0": "/tmp/a.bin", "1": "/tmp/b.bin" } };
+        throw new Error("stop after the first progress message");
+    };
+
+    await assert.rejects(
+        extractMethod("receiveViaHttp").call(app, {
+            transfer_id: "transfer-01",
+            files: [{ name: "a.bin", size: 1 }, { name: "b.bin", size: 1 }, { name: "c.bin", size: 1 }],
+        }),
+        /stop after the first progress message/);
+
+    assert.match(statuses[0], /2\/3/, `expected 2/3, got ${JSON.stringify(statuses[0])}`);
+});
+
+test("an absent received_files counts as zero rather than undefined", async () => {
+    // || {} guards the missing key; Object.keys({}) is 0, so the message is still
+    // a real number on the very first poll of a fresh transfer.
+    const { app } = fakeApp();
+    const statuses = [];
+    app.setStatus = (message) => statuses.push(message);
+    let poll = 0;
+    app.api = async () => {
+        poll += 1;
+        if (poll === 1) return { status: "PENDING" };
+        throw new Error("stop after the first progress message");
+    };
+
+    await assert.rejects(
+        extractMethod("receiveViaHttp").call(app, {
+            transfer_id: "transfer-01",
+            files: [{ name: "a.bin", size: 1 }],
+        }),
+        /stop after the first progress message/);
+
+    assert.match(statuses[0], /0\/1/, `expected 0/1, got ${JSON.stringify(statuses[0])}`);
 });
 
 // --- report ----------------------------------------------------------------

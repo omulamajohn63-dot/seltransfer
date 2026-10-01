@@ -11,18 +11,12 @@ import hashlib
 import pytest
 from fastapi.testclient import TestClient
 
-from seltransfer.server.app import create_app
-from seltransfer.storage import HistoryStore
-from seltransfer.transfers import TransferManager
+from tests.conftest import make_app, pair
 
 
 @pytest.fixture
 def app(tmp_path):
-    application = create_app(server_port=8781, local_address="127.0.0.1")
-    history = HistoryStore(tmp_path / "history.db")
-    application.state.history = history
-    application.state.transfers = TransferManager(tmp_path / "downloads", history)
-    return application
+    return make_app(tmp_path, port=8781)
 
 
 @pytest.fixture
@@ -61,7 +55,7 @@ def pending_transfer(client, sessions):
     """A PENDING transfer owned by browser-sender, addressed to browser-receiver."""
     content = b"payload"
     sessions("browser-receiver")
-    client.app.state.paired_devices.add("browser-receiver")
+    pair(client.app, "browser-receiver")
     created = client.post(
         "/api/transfers",
         json={"receiver_id": "browser-receiver",
@@ -128,9 +122,17 @@ def test_third_party_cannot_read_transfer_or_progress(client, sessions, pending_
                       headers=headers).status_code == 403
 
 
-def test_transfer_list_is_scoped_to_the_caller(client, sessions, pending_transfer):
-    """History is 'my transfers', not 'everything this server has ever seen'."""
-    assert client.get("/api/transfers").json()["transfers"] == []
+def test_transfer_list_is_scoped_to_the_caller(client, sessions, pending_transfer,
+                                               local_headers):
+    """History is 'my transfers', not 'everything this server has ever seen'.
+
+    An anonymous caller used to be silently treated as the local node, so this
+    endpoint answered their request instead of refusing it. It must now reject
+    them outright: no identity means no history.
+    """
+    anonymous = client.get("/api/transfers")
+    assert anonymous.status_code == 401, anonymous.text
+    assert "session" in anonymous.json()["detail"].lower()
 
     for participant in ("browser-sender", "browser-receiver"):
         listed = client.get("/api/transfers", headers=sessions.headers(participant))
@@ -141,7 +143,13 @@ def test_transfer_list_is_scoped_to_the_caller(client, sessions, pending_transfe
     ).json()["transfers"] == []
 
 
-def test_clear_history_only_removes_the_callers_rows(client, app):
+def test_history_clear_also_requires_an_identity(client, app):
+    """Clearing history is a state change, so it cannot be anonymous."""
+    assert client.delete("/api/transfers/history").status_code == 401
+    assert client.post("/api/transfers/history/clear").status_code == 401
+
+
+def test_clear_history_only_removes_the_callers_rows(client, app, local_headers):
     local_id = app.state.registry.local_device.device_id
     for sender, receiver in ((local_id, "peer-node"), ("peer-node", local_id), ("x", "y")):
         app.state.history.record({
@@ -150,7 +158,8 @@ def test_clear_history_only_removes_the_callers_rows(client, app):
             "files": [{"name": "f.txt", "size": 1}], "total_bytes": 1,
             "status": "VERIFIED"})
 
-    assert client.delete("/api/transfers/history").status_code == 200
+    assert client.delete("/api/transfers/history",
+                         headers=local_headers).status_code == 200
 
     remaining = {row["transfer_id"] for row in app.state.history.list_recent()}
     assert remaining == {"t-x-y"}
@@ -160,27 +169,28 @@ def test_sender_receives_upload_token_after_accept(tmp_path):
     """The native CLI can only learn the token from its own server."""
     from seltransfer.devices import Device
 
-    sender_app = create_app(server_port=8782, local_address="127.0.0.1")
-    sender_app.state.transfers = TransferManager(
-        tmp_path / "sender", HistoryStore(tmp_path / "sender.db"))
+    sender_app = make_app(tmp_path, port=8782)
+    headers = {"x-seltransfer-local": sender_app.state.local_token}
     sender_client = TestClient(sender_app)
     peer_id = "peer-node-1234"
     sender_app.state.registry.upsert(
         Device(device_id=peer_id, name="Peer", type="computer", ip="127.0.0.1",
                port=8765, node_type="server"))
-    sender_app.state.paired_devices.add(peer_id)
+    pair(sender_app, peer_id)
 
     created = sender_client.post(
         "/api/transfers", json={"receiver_id": peer_id,
-                                "files": [{"name": "f.txt", "size": 1}]})
+                                "files": [{"name": "f.txt", "size": 1}]},
+        headers=headers)
     assert created.status_code == 200, created.text
     transfer_id = created.json()["transfer_id"]
 
     # No token before acceptance.
-    assert "transfer_token" not in sender_client.get(f"/api/transfers/{transfer_id}").json()
+    assert "transfer_token" not in sender_client.get(
+        f"/api/transfers/{transfer_id}", headers=headers).json()
 
     sender_app.state.transfers.update_state(transfer_id, "ACCEPTED")
-    response = sender_client.get(f"/api/transfers/{transfer_id}")
+    response = sender_client.get(f"/api/transfers/{transfer_id}", headers=headers)
 
     assert response.status_code == 200
     assert response.json()["transfer_token"]
@@ -189,7 +199,7 @@ def test_sender_receives_upload_token_after_accept(tmp_path):
 def test_browser_receiver_gets_no_push_token_on_webrtc(client, sessions):
     """On the WebRTC path the receiver pulls, so it must not get a push token."""
     sessions("browser-receiver")
-    client.app.state.paired_devices.add("browser-receiver")
+    pair(client.app, "browser-receiver")
     created = client.post(
         "/api/transfers",
         json={"receiver_id": "browser-receiver",
@@ -210,7 +220,7 @@ def test_browser_receiver_gets_no_push_token_on_webrtc(client, sessions):
 def test_browser_receiver_does_get_a_push_token_on_http(client, sessions):
     """On the default HTTP path the sender must be able to push to the phone."""
     sessions("browser-receiver")
-    client.app.state.paired_devices.add("browser-receiver")
+    pair(client.app, "browser-receiver")
     created = client.post(
         "/api/transfers",
         json={"receiver_id": "browser-receiver",
@@ -230,7 +240,7 @@ def test_browser_receiver_does_get_a_push_token_on_http(client, sessions):
 def test_third_party_cannot_read_a_pushed_file(client, sessions):
     """The download endpoint is scoped to the intended receiver."""
     sessions("browser-receiver")
-    client.app.state.paired_devices.add("browser-receiver")
+    pair(client.app, "browser-receiver")
     created = client.post(
         "/api/transfers",
         json={"receiver_id": "browser-receiver",

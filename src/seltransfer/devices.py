@@ -11,6 +11,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 
+from . import __version__
 from .network import get_all_interfaces
 
 logger = logging.getLogger("seltransfer.discovery")
@@ -115,7 +116,7 @@ class Device:
     browser: str | None = None
     session_id: str | None = field(default=None, repr=False)
     status: str = "online"
-    version: str = "0.1.0"
+    version: str = __version__
     capabilities: list[str] = field(default_factory=lambda: [
         "send", "receive", "multiple_files", "folders"])
     display_name: str | None = None

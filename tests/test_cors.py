@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from seltransfer.server.app import PRIVATE_ORIGIN_PATTERN, create_app
+from tests.conftest import make_app
 
 ACCEPTED = [
     "http://192.168.1.5:8765",
@@ -50,7 +51,7 @@ REJECTED = [
 
 @pytest.fixture
 def client(tmp_path):
-    return TestClient(create_app(server_port=8783, local_address="127.0.0.1"))
+    return TestClient(make_app(tmp_path, port=8783))
 
 
 @pytest.mark.parametrize("origin", ACCEPTED)

@@ -16,8 +16,15 @@ def test_safe_relative_path_rejects_traversal():
 
 
 def test_android_hint_does_not_change_native_app_directory(monkeypatch):
+    # The suite-wide conftest redirects SELTRANSFER_APP_DIR, so remove it to reach
+    # the real default branch this test is about.
+    monkeypatch.delenv("SELTRANSFER_APP_DIR", raising=False)
     monkeypatch.setenv("ANDROID_STORAGE", "/storage/emulated/0")
-    assert resolve_app_dir("Android") == Path.home() / ".seltransfer"
+    # The invariant is that the hint is ignored, not that the directory is a
+    # particular shape: on Windows the default is %LOCALAPPDATA%\SELTRANSFER.
+    assert resolve_app_dir("Android") == resolve_app_dir()
+    assert resolve_app_dir("Android") == resolve_app_dir("Windows")
+    assert resolve_app_dir("Android") != Path("/storage/emulated/0")
 
 
 @pytest.mark.asyncio
